@@ -19,26 +19,26 @@ class RulesCog(commands.Cog):
         with open("config/rules_config.json", "r", encoding="utf-8") as f:
             return json.load(f)
 
-    def make_rules_text(self) -> str:
-    config = self.config
-    lines = []
+        def make_rules_text(self) -> str:
+        config = self.config
+        lines = []
 
-    lines.append("# " + config["title"])
-    lines.append("")
-
-    if config.get("description"):
-        lines.append(config["description"])
+        lines.append("# " + config["title"])
         lines.append("")
 
-    for field in config.get("fields", []):
-        lines.append("## " + field["name"])
-        lines.append(field["value"])
-        lines.append("")
+        if config.get("description"):
+            lines.append(config["description"])
+            lines.append("")
 
-    if config.get("footer"):
-        lines.append("-# " + config["footer"])
+        for field in config.get("fields", []):
+            lines.append("## " + field["name"])
+            lines.append(field["value"])
+            lines.append("")
 
-    return "\n".join(lines)
+        if config.get("footer"):
+            lines.append("-# " + config["footer"])
+
+        return "\n".join(lines)
 
     def get_guild_settings(self, guild_id: int) -> dict:
         """サーバー設定をファイルから読み込んで返す"""
