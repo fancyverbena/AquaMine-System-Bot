@@ -19,7 +19,7 @@ class RulesCog(commands.Cog):
         with open("config/rules_config.json", "r", encoding="utf-8") as f:
             return json.load(f)
 
-        def make_rules_text(self) -> str:
+    def make_rules_text(self) -> str:
         config = self.config
         lines = []
 
