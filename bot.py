@@ -7,28 +7,38 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="^", intents=intents)
 
 
 async def setup_hook():
     bot.tree.clear_commands(guild=None)
-    for guild in bot.guilds:
-        bot.tree.clear_commands(guild=guild)
+    print("🧹 グローバルコマンドを削除しました。")
 
     for filename in os.listdir("./cogs"):
         if filename.endswith(".py") and filename != "__init__.py":
             await bot.load_extension(f"cogs.{filename[:-3]}")
 
-    await bot.tree.sync()
-    print("✅ スラッシュコマンドをクリーン同期しました。")
-
-
-bot.setup_hook = setup_hook
+    for guild in bot.guilds:
+        bot.tree.clear_commands(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"✅ {guild.name} にコマンドを同期しました。")
 
 
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} としてログインしました。")
+
+
+@bot.event
+async def on_guild_join(guild):
+    try:
+        await bot.tree.sync(guild=guild)
+        print(f"✅ 新規サーバー {guild.name} にコマンドを同期しました。")
+    except Exception as e:
+        print(f"❌ {guild.name} への同期エラー: {e}")
+
+
+bot.setup_hook = setup_hook
 
 
 if __name__ == "__main__":

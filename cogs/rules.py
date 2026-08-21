@@ -1,5 +1,6 @@
 import json
 import os
+import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -15,7 +16,6 @@ class RulesCog(commands.Cog):
                 json.dump({}, f)
 
     def load_config(self) -> dict:
-        """ルール本文の設定ファイルを読み込む"""
         with open("config/rules_config.json", "r", encoding="utf-8") as f:
             return json.load(f)
 
@@ -41,13 +41,11 @@ class RulesCog(commands.Cog):
         return "\n".join(lines)
 
     def get_guild_settings(self, guild_id: int) -> dict:
-        """サーバー設定をファイルから読み込んで返す"""
         with open(self.guild_settings_path, "r", encoding="utf-8") as f:
             all_settings = json.load(f)
         return all_settings.get(str(guild_id), {})
 
     def save_guild_settings(self, guild_id: int, settings: dict):
-        """サーバー設定を保存する"""
         with open(self.guild_settings_path, "r", encoding="utf-8") as f:
             all_settings = json.load(f)
         all_settings[str(guild_id)] = settings
@@ -64,6 +62,7 @@ class RulesCog(commands.Cog):
             guild_id = interaction.guild_id
             settings = self.cog.get_guild_settings(guild_id)
             role_id = settings.get("verified_role")
+
             if role_id is None:
                 await interaction.response.send_message(
                     "⚠️ 認証ロールが設定されていません。管理者が `/set-verified-role` で設定してください。",
@@ -89,8 +88,15 @@ class RulesCog(commands.Cog):
                 return
 
             await interaction.response.send_message(
-                f"✅ **{interaction.user.mention} さんがサーバールールに同意しました。**"
+                f"✅ **{interaction.user.mention} さん、ルールに同意しました。**",
+                ephemeral=True
             )
+
+            await asyncio.sleep(5)
+            try:
+                await interaction.delete_original_response()
+            except discord.HTTPException:
+                pass
 
     @app_commands.command(name="accept-rules", description="サーバールールを表示し、同意します。")
     async def accept_rules(self, interaction: discord.Interaction):
