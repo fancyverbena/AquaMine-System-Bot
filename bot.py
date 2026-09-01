@@ -42,8 +42,25 @@ async def on_ready():
     
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
-        await bot.tree.sync(guild=guild)
-        print(f"✅ コマンドをギルド {GUILD_ID} に同期しました。")
+        try:
+            await bot.tree.sync(guild=guild)
+            print(f"✅ コマンドをギルド {GUILD_ID} に同期しました。")
+            
+            cmds = await bot.tree.fetch_commands(guild=guild)
+            cmd_names = [cmd.name for cmd in cmds]
+            print(f"📋 登録済みコマンド一覧: {cmd_names}")
+            
+        except Exception as e:
+            print(f"❌ ギルド同期エラー: {e}")
+    else:
+        try:
+            await bot.tree.sync()
+            print("✅ コマンドをグローバルに同期しました。")
+            cmds = await bot.tree.fetch_commands()
+            cmd_names = [cmd.name for cmd in cmds]
+            print(f"📋 登録済みコマンド一覧: {cmd_names}")
+        except Exception as e:
+            print(f"❌ グローバル同期エラー: {e}")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
