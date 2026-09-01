@@ -12,14 +12,17 @@ bot = commands.Bot(command_prefix="^", intents=intents)
 
 async def setup_hook():
     bot.tree.clear_commands(guild=None)
-    print("🧹 グローバルコマンドを削除しました。")
+    await bot.tree.sync()
+
+    for guild in bot.guilds:
+        bot.tree.clear_commands(guild=guild)
+        await bot.tree.sync(guild=guild)
 
     for filename in os.listdir("./cogs"):
         if filename.endswith(".py") and filename != "__init__.py":
             await bot.load_extension(f"cogs.{filename[:-3]}")
 
     for guild in bot.guilds:
-        bot.tree.clear_commands(guild=guild)
         await bot.tree.sync(guild=guild)
         print(f"✅ {guild.name} にコマンドを同期しました。")
 
