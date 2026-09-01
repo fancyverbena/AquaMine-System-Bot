@@ -6,6 +6,57 @@ from discord.ext import commands
 from discord import app_commands
 
 
+class AgreeButtonView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="同意する", style=discord.ButtonStyle.success, custom_id="agree_rules")
+    async def agree_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        cog = interaction.client.get_cog("RulesCog")
+        if cog is None:
+            await interaction.response.send_message("⚠️ システムエラーが発生しました。", ephemeral=True)
+            return
+
+        guild_id = interaction.guild_id
+        settings = cog.get_guild_settings(guild_id)
+        role_id = settings.get("verified_role")
+
+        if role_id is None:
+            await interaction.response.send_message(
+                "⚠️ 認証ロールが設定されていません。管理者が `/set-verified-role` で設定してください。",
+                ephemeral=True
+            )
+            return
+
+        role = interaction.guild.get_role(int(role_id))
+        if role is None:
+            await interaction.response.send_message(
+                "⚠️ 設定されたロールが存在しません。管理者に確認してください。",
+                ephemeral=True
+            )
+            return
+
+        try:
+            await interaction.user.add_roles(role, reason="ルール同意による認証")
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "⚠️ Botにロールを付与する権限がありません。",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            "✅ サーバールールに同意しました。",
+            ephemeral=True
+        )
+
+        await asyncio.sleep(5)
+        try:
+            await interaction.delete_original_response()
+        except discord.HTTPException:
+            pass
+
+
 class RulesCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -52,56 +103,10 @@ class RulesCog(commands.Cog):
         with open(self.guild_settings_path, "w", encoding="utf-8") as f:
             json.dump(all_settings, f, indent=2)
 
-    class AgreeButtonView(discord.ui.View):
-        def __init__(self, cog):
-            super().__init__(timeout=None)
-            self.cog = cog
-
-        @discord.ui.button(label="同意する", style=discord.ButtonStyle.success, custom_id="agree_rules")
-        async def agree_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-            guild_id = interaction.guild_id
-            settings = self.cog.get_guild_settings(guild_id)
-            role_id = settings.get("verified_role")
-
-            if role_id is None:
-                await interaction.response.send_message(
-                    "⚠️ 認証ロールが設定されていません。管理者が `/set-verified-role` で設定してください。",
-                    ephemeral=True
-                )
-                return
-
-            role = interaction.guild.get_role(int(role_id))
-            if role is None:
-                await interaction.response.send_message(
-                    "⚠️ 設定されたロールが存在しません。管理者に確認してください。",
-                    ephemeral=True
-                )
-                return
-
-            try:
-                await interaction.user.add_roles(role, reason="ルール同意による認証")
-            except discord.Forbidden:
-                await interaction.response.send_message(
-                    "⚠️ Botにロールを付与する権限がありません。",
-                    ephemeral=True
-                )
-                return
-
-            await interaction.response.send_message(
-                f"✅ **{interaction.user.mention} さん、ルールに同意しました。**",
-                ephemeral=True
-            )
-
-            await asyncio.sleep(5)
-            try:
-                await interaction.delete_original_response()
-            except discord.HTTPException:
-                pass
-
     @app_commands.command(name="accept-rules", description="サーバールールを表示し、同意します。")
     async def accept_rules(self, interaction: discord.Interaction):
         text = self.make_rules_text()
-        view = self.AgreeButtonView(self)
+        view = AgreeButtonView()
         await interaction.response.send_message(
             "以下のルールをお読みいただき、同意される場合は「同意する」ボタンを押してください。\n\n" + text,
             view=view
