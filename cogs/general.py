@@ -5,7 +5,7 @@ class GeneralCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @commands.command(name="ping")
+    @commands.command(name="ping", aliases=["p"])
     async def ping(self, ctx: commands.Context):
         await ctx.send("Pong!")
 
