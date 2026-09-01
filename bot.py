@@ -1,4 +1,5 @@
 import os
+import sys
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -28,26 +29,50 @@ bot = commands.Bot(command_prefix="/", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot起動完了: {bot.user} (ID: {bot.user.id})")
+    print("🔵 on_ready が呼び出されました！", flush=True)
+    print(f"✅ Bot起動完了: {bot.user} (ID: {bot.user.id})", flush=True)
     
-    from cogs.rules import AgreeButtonView
-    bot.add_view(AgreeButtonView())
+    try:
+        from cogs.rules import AgreeButtonView
+        bot.add_view(AgreeButtonView())
+        print("✅ AgreeButtonView 登録完了", flush=True)
+    except Exception as e:
+        print(f"❌ AgreeButtonView 登録エラー: {e}", flush=True)
     
-    from cogs.tickets import TicketView, CloseView
-    bot.add_view(TicketView())
-    bot.add_view(CloseView())
+    try:
+        from cogs.tickets import TicketView, CloseView
+        bot.add_view(TicketView())
+        bot.add_view(CloseView())
+        print("✅ TicketView / CloseView 登録完了", flush=True)
+    except Exception as e:
+        print(f"❌ TicketView 登録エラー: {e}", flush=True)
     
-    await bot.load_extension("cogs.rules")
-    await bot.load_extension("cogs.tickets")
-    print("✅ すべてのCogを読み込みました。")
+    try:
+        await bot.load_extension("cogs.rules")
+        print("✅ rules Cog 読み込み成功", flush=True)
+    except Exception as e:
+        print(f"❌ rules Cog 読み込み失敗: {e}", flush=True)
+    
+    try:
+        await bot.load_extension("cogs.tickets")
+        print("✅ tickets Cog 読み込み成功", flush=True)
+    except Exception as e:
+        print(f"❌ tickets Cog 読み込み失敗: {e}", flush=True)
     
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
-        await bot.tree.sync(guild=guild)
-        print(f"✅ コマンドをギルド {GUILD_ID} に同期しました（即時反映）。")
+        try:
+            await bot.tree.sync(guild=guild)
+            print(f"✅ コマンドをギルド {GUILD_ID} に同期しました（即時反映）。", flush=True)
+        except Exception as e:
+            print(f"❌ ギルド同期エラー: {e}", flush=True)
     else:
-        await bot.tree.sync()
-        print("✅ コマンドをグローバルに同期しました（反映に最大1時間）。")
+        try:
+            await bot.tree.sync()
+            print("✅ コマンドをグローバルに同期しました（反映に最大1時間）。", flush=True)
+        except Exception as e:
+            print(f"❌ グローバル同期エラー: {e}", flush=True)
 
 if __name__ == "__main__":
+    print("🚀 ボットを起動します...", flush=True)
     bot.run(TOKEN)
