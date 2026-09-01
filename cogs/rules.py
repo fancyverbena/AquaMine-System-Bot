@@ -136,5 +136,16 @@ class RulesCog(commands.Cog):
             ephemeral=True
         )
 
+    @app_commands.command(name="sync", description="スラッシュコマンドを手動同期（管理者専用）")
+    @app_commands.default_permissions(administrator=True)
+    async def sync_commands(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            guild = discord.Object(id=interaction.guild_id)
+            await interaction.client.tree.sync(guild=guild)
+            await interaction.followup.send("✅ コマンドを同期しました！", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ 同期エラー: {e}", ephemeral=True)
+
 async def setup(bot: commands.Bot):
     await bot.add_cog(RulesCog(bot))

@@ -1,5 +1,4 @@
 import os
-import sys
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -27,63 +26,24 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="/", intents=intents)
 
-@app_commands.command(name="sync", description="スラッシュコマンドを手動同期（管理者専用）")
-@app_commands.default_permissions(administrator=True)
-async def sync(self, interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    try:
-        guild = discord.Object(id=interaction.guild_id)
-        await interaction.client.tree.sync(guild=guild)
-        await interaction.followup.send("✅ コマンドを同期しました！", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"❌ 同期エラー: {e}", ephemeral=True)
-
 @bot.event
 async def on_ready():
-    print("🔵 on_ready が呼び出されました！", flush=True)
-    print(f"✅ Bot起動完了: {bot.user} (ID: {bot.user.id})", flush=True)
+    print(f"✅ Bot起動完了: {bot.user} (ID: {bot.user.id})")
     
-    try:
-        from cogs.rules import AgreeButtonView
-        bot.add_view(AgreeButtonView())
-        print("✅ AgreeButtonView 登録完了", flush=True)
-    except Exception as e:
-        print(f"❌ AgreeButtonView 登録エラー: {e}", flush=True)
+    from cogs.rules import AgreeButtonView
+    bot.add_view(AgreeButtonView())
     
-    try:
-        from cogs.tickets import TicketView, CloseView
-        bot.add_view(TicketView())
-        bot.add_view(CloseView())
-        print("✅ TicketView / CloseView 登録完了", flush=True)
-    except Exception as e:
-        print(f"❌ TicketView 登録エラー: {e}", flush=True)
+    from cogs.tickets import TicketView, CloseView
+    bot.add_view(TicketView())
+    bot.add_view(CloseView())
     
-    try:
-        await bot.load_extension("cogs.rules")
-        print("✅ rules Cog 読み込み成功", flush=True)
-    except Exception as e:
-        print(f"❌ rules Cog 読み込み失敗: {e}", flush=True)
-    
-    try:
-        await bot.load_extension("cogs.tickets")
-        print("✅ tickets Cog 読み込み成功", flush=True)
-    except Exception as e:
-        print(f"❌ tickets Cog 読み込み失敗: {e}", flush=True)
+    await bot.load_extension("cogs.rules")
+    await bot.load_extension("cogs.tickets")
     
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
-        try:
-            await bot.tree.sync(guild=guild)
-            print(f"✅ コマンドをギルド {GUILD_ID} に同期しました（即時反映）。", flush=True)
-        except Exception as e:
-            print(f"❌ ギルド同期エラー: {e}", flush=True)
-    else:
-        try:
-            await bot.tree.sync()
-            print("✅ コマンドをグローバルに同期しました（反映に最大1時間）。", flush=True)
-        except Exception as e:
-            print(f"❌ グローバル同期エラー: {e}", flush=True)
+        await bot.tree.sync(guild=guild)
+        print(f"✅ コマンドをギルド {GUILD_ID} に同期しました。")
 
 if __name__ == "__main__":
-    print("🚀 ボットを起動します...", flush=True)
     bot.run(TOKEN)
