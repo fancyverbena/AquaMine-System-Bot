@@ -1,17 +1,19 @@
 # AquaMine System Bot
 
-AquaMine サービス向けの Discord 管理ボットです。
+このボットは、Discordサーバーで「ルール同意」による認証ロール付与を実現するオープンソースボットです。
 
 ## 機能
-- サーバー管理用コマンド（現在開発中）
-- 例：`!ping` で疎通確認
+- `/accept-rules` : サーバールールを表示し、同意ボタンを押すと認証ロールが付与されます。
+- `/set-verified-role` : 管理者が付与するロールを設定できます。
 
-## 必要なもの
-- [Discord Bot トークン](https://discord.com/developers/applications)
-- Docker または Python 3.12 以上
+## 使い方（Docker）
 
-## セットアップ（Docker を使う場合）
-1. リポジトリをクローン
-   ```bash
-   git clone https://github.com/fancyverbena/AquaMine-System-Bot.git
-   cd AquaMine-System-Bot
+1. `.env.sample` を `.env` にリネームし、`DISCORD_TOKEN` を設定。
+2. `docker-compose up -d` で起動。
+
+## 設定ファイル
+- `config/rules_config.json` : ルールの本文を編集できます。
+- `config/guild_settings.json` : 各サーバーの設定（ロールID）が保存されます。
+
+## ライセンス
+MIT

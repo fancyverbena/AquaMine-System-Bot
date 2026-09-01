@@ -1,11 +1,7 @@
-.env
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-venv/
-env/
-docker-compose.override.yml
+.env
+config/guild_settings.json
 .vscode/
 .idea/
-.DS_Store
-Thumbs.db

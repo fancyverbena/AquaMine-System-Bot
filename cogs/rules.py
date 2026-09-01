@@ -5,7 +5,6 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 
-
 class AgreeButtonView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -56,39 +55,51 @@ class AgreeButtonView(discord.ui.View):
         except discord.HTTPException:
             pass
 
-
 class RulesCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.config = self.load_config()
+        self.config_path = "config/rules_config.json"
         self.guild_settings_path = "config/guild_settings.json"
+        
         if not os.path.exists(self.guild_settings_path):
+            os.makedirs(os.path.dirname(self.guild_settings_path), exist_ok=True)
             with open(self.guild_settings_path, "w", encoding="utf-8") as f:
                 json.dump({}, f)
 
+        if not os.path.exists(self.config_path):
+            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+            sample = {
+                "title": "サーバールール",
+                "description": "このサーバーを利用する際のルールです。",
+                "fields": [
+                    {"name": "1. 敬語の使用", "value": "メンバー同士で敬語を使用してください。"},
+                    {"name": "2. NSFW禁止", "value": "NSFWコンテンツの投稿は禁止です。"}
+                ],
+                "footer": "ルールは予告なく変更されることがあります。"
+            }
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                json.dump(sample, f, indent=2, ensure_ascii=False)
+
+        self.config = self.load_config()
+
     def load_config(self) -> dict:
-        with open("config/rules_config.json", "r", encoding="utf-8") as f:
+        with open(self.config_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def make_rules_text(self) -> str:
         config = self.config
         lines = []
-
         lines.append("# " + config["title"])
         lines.append("")
-
         if config.get("description"):
             lines.append(config["description"])
             lines.append("")
-
         for field in config.get("fields", []):
             lines.append("## " + field["name"])
             lines.append(field["value"])
             lines.append("")
-
         if config.get("footer"):
             lines.append("-# " + config["footer"])
-
         return "\n".join(lines)
 
     def get_guild_settings(self, guild_id: int) -> dict:
@@ -124,7 +135,6 @@ class RulesCog(commands.Cog):
             f"✅ 認証ロールを {role.mention} に設定しました。",
             ephemeral=True
         )
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(RulesCog(bot))

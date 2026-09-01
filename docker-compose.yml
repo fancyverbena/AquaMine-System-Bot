@@ -1,11 +1,13 @@
-version: "3.8"
-
+version: '3.8'
 services:
   bot:
     build: .
-    container_name: aqua-mine-bot
+    container_name: aquamine-bot
     restart: unless-stopped
     env_file:
       - .env
     volumes:
       - ./config:/app/config
+      - ./logs:/app/logs
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
