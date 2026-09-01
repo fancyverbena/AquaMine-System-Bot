@@ -27,6 +27,7 @@ bot = AquaMineBot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"✅ {bot.user} としてログインしました。")
     print(f"現在参加しているサーバー数: {len(bot.guilds)}")
+
     for guild in bot.guilds:
         print(f" - {guild.name} (ID: {guild.id})")
         if guild.id in bot.synced_guilds:
@@ -54,6 +55,7 @@ async def on_guild_join(guild):
 
 
 @bot.command(name="sync")
+@commands.has_permissions(administrator=True)
 async def sync_commands(ctx):
     if ctx.guild is None:
         await ctx.send("❌ このコマンドはサーバー内で実行してください。")
