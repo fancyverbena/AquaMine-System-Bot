@@ -27,6 +27,17 @@ intents.members = True
 
 bot = commands.Bot(command_prefix="/", intents=intents)
 
+@app_commands.command(name="sync", description="スラッシュコマンドを手動同期（管理者専用）")
+@app_commands.default_permissions(administrator=True)
+async def sync(self, interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        guild = discord.Object(id=interaction.guild_id)
+        await interaction.client.tree.sync(guild=guild)
+        await interaction.followup.send("✅ コマンドを同期しました！", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 同期エラー: {e}", ephemeral=True)
+
 @bot.event
 async def on_ready():
     print("🔵 on_ready が呼び出されました！", flush=True)
