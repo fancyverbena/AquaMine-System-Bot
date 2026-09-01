@@ -7,29 +7,29 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="^", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 
 async def setup_hook():
-    bot.tree.clear_commands(guild=None)
-    await bot.tree.sync()
-
-    for guild in bot.guilds:
-        bot.tree.clear_commands(guild=guild)
-        await bot.tree.sync(guild=guild)
-
     for filename in os.listdir("./cogs"):
         if filename.endswith(".py") and filename != "__init__.py":
             await bot.load_extension(f"cogs.{filename[:-3]}")
+    print("✅ Cogを読み込みました。")
 
-    for guild in bot.guilds:
-        await bot.tree.sync(guild=guild)
-        print(f"✅ {guild.name} にコマンドを同期しました。")
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
+    print("グローバルコマンドを削除しました。")
 
 
 @bot.event
 async def on_ready():
     print(f"✅ {bot.user} としてログインしました。")
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=guild)
+            print(f"✅ {guild.name} にコマンドを同期しました。")
+        except Exception as e:
+            print(f"❌ {guild.name} への同期エラー: {e}")
 
 
 @bot.event
