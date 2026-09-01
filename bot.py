@@ -23,27 +23,31 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True
+
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot起動完了: {bot.user}")
+    print(f"✅ Bot起動完了: {bot.user} (ID: {bot.user.id})")
     
     from cogs.rules import AgreeButtonView
     bot.add_view(AgreeButtonView())
-
-    from cogs.tickets import TicketView, CloseView, ConfirmCloseView
+    
+    from cogs.tickets import TicketView, CloseView
     bot.add_view(TicketView())
     bot.add_view(CloseView())
-    bot.add_view(ConfirmCloseView(None))
     
     await bot.load_extension("cogs.rules")
     await bot.load_extension("cogs.tickets")
+    print("✅ すべてのCogを読み込みました。")
     
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         await bot.tree.sync(guild=guild)
-        print(f"✅ コマンドをギルド {GUILD_ID} に同期しました。")
+        print(f"✅ コマンドをギルド {GUILD_ID} に同期しました（即時反映）。")
+    else:
+        await bot.tree.sync()
+        print("✅ コマンドをグローバルに同期しました（反映に最大1時間）。")
 
 if __name__ == "__main__":
     bot.run(TOKEN)
