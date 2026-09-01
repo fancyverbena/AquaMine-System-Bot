@@ -13,5 +13,5 @@ AquaMine サービス向けの Discord 管理ボットです。
 ## セットアップ（Docker を使う場合）
 1. リポジトリをクローン
    ```bash
-   git clone https://github.com/あなたのユーザー名/AquaMine-System-Bot.git
+   git clone https://github.com/fancyverbena/AquaMine-System-Bot.git
    cd AquaMine-System-Bot
