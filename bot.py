@@ -1,4 +1,3 @@
-```python
 import os
 import discord
 from discord.ext import commands
@@ -73,4 +72,3 @@ async def on_ready():
 
 if __name__ == "__main__":
     bot.run(TOKEN)
-```
