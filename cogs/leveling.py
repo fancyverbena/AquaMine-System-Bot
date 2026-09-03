@@ -5,7 +5,7 @@ import sqlite3
 import time
 import discord
 from discord.ext import commands
-
+from discord import app_commands
 
 DB_PATH = "data/leveling.db"
 GUILD_SETTINGS_PATH = "config/guild_settings.json"
@@ -47,7 +47,10 @@ class LevelingCog(commands.Cog):
 
     def load_guild_settings(self):
         if not os.path.exists(self.guild_settings_path):
-            self.save_json(self.guild_settings_path, {})
+            self.save_json(
+                self.guild_settings_path,
+                {}
+            )
             return {}
 
         try:
@@ -59,13 +62,19 @@ class LevelingCog(commands.Cog):
                 content = f.read().strip()
 
             if not content:
-                self.save_json(self.guild_settings_path, {})
+                self.save_json(
+                    self.guild_settings_path,
+                    {}
+                )
                 return {}
 
             data = json.loads(content)
 
             if not isinstance(data, dict):
-                self.save_json(self.guild_settings_path, {})
+                self.save_json(
+                    self.guild_settings_path,
+                    {}
+                )
                 return {}
 
             return data
@@ -75,14 +84,20 @@ class LevelingCog(commands.Cog):
             UnicodeDecodeError,
             OSError
         ):
-            self.save_json(self.guild_settings_path, {})
+            self.save_json(
+                self.guild_settings_path,
+                {}
+            )
             return {}
 
     def save_json(self, path, data):
-        os.makedirs(
-            os.path.dirname(path),
-            exist_ok=True
-        )
+        directory = os.path.dirname(path)
+
+        if directory:
+            os.makedirs(
+                directory,
+                exist_ok=True
+            )
 
         temp_path = f"{path}.tmp"
 
@@ -108,16 +123,22 @@ class LevelingCog(commands.Cog):
         user_id: int,
         guild_id: int
     ):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(
+            self.db_path
+        )
         c = conn.cursor()
 
         c.execute(
             """
             SELECT xp, level, last_message_time
             FROM user_xp
-            WHERE user_id = ? AND guild_id = ?
+            WHERE user_id = ?
+            AND guild_id = ?
             """,
-            (user_id, guild_id)
+            (
+                user_id,
+                guild_id
+            )
         )
 
         result = c.fetchone()
@@ -126,10 +147,19 @@ class LevelingCog(commands.Cog):
             c.execute(
                 """
                 INSERT INTO user_xp
-                (user_id, guild_id, xp, level, last_message_time)
+                (
+                    user_id,
+                    guild_id,
+                    xp,
+                    level,
+                    last_message_time
+                )
                 VALUES (?, ?, 0, 0, 0)
                 """,
-                (user_id, guild_id)
+                (
+                    user_id,
+                    guild_id
+                )
             )
 
             conn.commit()
@@ -157,14 +187,19 @@ class LevelingCog(commands.Cog):
         level: int,
         last_time: float
     ):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(
+            self.db_path
+        )
         c = conn.cursor()
 
         c.execute(
             """
             UPDATE user_xp
-            SET xp = ?, level = ?, last_message_time = ?
-            WHERE user_id = ? AND guild_id = ?
+            SET xp = ?,
+                level = ?,
+                last_message_time = ?
+            WHERE user_id = ?
+            AND guild_id = ?
             """,
             (
                 xp,
@@ -183,7 +218,9 @@ class LevelingCog(commands.Cog):
         user_id: int,
         guild_id: int
     ) -> int:
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(
+            self.db_path
+        )
         c = conn.cursor()
 
         c.execute(
@@ -216,7 +253,9 @@ class LevelingCog(commands.Cog):
         guild_id: int,
         limit: int = 10
     ):
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(
+            self.db_path
+        )
         c = conn.cursor()
 
         c.execute(
@@ -363,15 +402,13 @@ class LevelingCog(commands.Cog):
                         )
 
                         print(
-                            f"✅ {member} に"
+                            f"✅ {member} に "
                             f"ロール {role.name} を付与しました"
-                            f"（レベル {level}）"
                         )
 
                     except discord.Forbidden:
                         print(
-                            f"⚠️ ロール {role.name} を"
-                            f"付与する権限がありません。"
+                            f"⚠️ ロール {role.name} を付与する権限がありません。"
                         )
 
                     except discord.HTTPException as e:
@@ -444,6 +481,236 @@ class LevelingCog(commands.Cog):
             await self.check_and_assign_roles(
                 user,
                 new_level
+            )
+
+    @app_commands.command(
+        name="rank",
+        description="自分の現在のランクとレベルを表示"
+    )
+    async def rank(
+        self,
+        interaction: discord.Interaction
+    ):
+        user = interaction.user
+        guild = interaction.guild
+
+        data = self.get_user_data(
+            user.id,
+            guild.id
+        )
+
+        rank = self.get_rank(
+            user.id,
+            guild.id
+        )
+
+        xp = data["xp"]
+        level = data["level"]
+
+        next_xp = self.get_level_up_xp(
+            level
+        )
+
+        current_level_xp = self.calc_xp_for_level(
+            level
+        )
+
+        progress = xp - current_level_xp
+        needed = next_xp - current_level_xp
+
+        progress_percent = (
+            int((progress / needed) * 100)
+            if needed > 0
+            else 0
+        )
+
+        embed = discord.Embed(
+            title=f"📊 {user.display_name} のランク",
+            color=discord.Color.blue()
+        )
+
+        embed.add_field(
+            name="ランキング",
+            value=f"#{rank}",
+            inline=True
+        )
+
+        embed.add_field(
+            name="レベル",
+            value=f"Lv.{level}",
+            inline=True
+        )
+
+        embed.add_field(
+            name="総XP",
+            value=f"{xp} XP",
+            inline=True
+        )
+
+        embed.add_field(
+            name="次のレベルまで",
+            value=(
+                f"{needed - progress} XP "
+                f"(進捗 {progress_percent}%)"
+            ),
+            inline=False
+        )
+
+        embed.set_footer(
+            text="スパム防止のため、30秒に1回だけカウントされます。"
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="leaderboard",
+        description="サーバーのXPランキングトップ10を表示"
+    )
+    async def leaderboard(
+        self,
+        interaction: discord.Interaction
+    ):
+        guild = interaction.guild
+
+        top_users = self.get_top_users(
+            guild.id,
+            10
+        )
+
+        if not top_users:
+            await interaction.response.send_message(
+                "まだデータがありません。",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(
+            title=f"🏆 {guild.name} レベルランキング",
+            color=discord.Color.gold()
+        )
+
+        description = []
+
+        for i, (user_id, xp, level) in enumerate(
+            top_users,
+            1
+        ):
+            member = guild.get_member(
+                user_id
+            )
+
+            name = (
+                member.display_name
+                if member
+                else f"不明なユーザー (ID: {user_id})"
+            )
+
+            medal = (
+                "🥇"
+                if i == 1
+                else "🥈"
+                if i == 2
+                else "🥉"
+                if i == 3
+                else f"{i}."
+            )
+
+            description.append(
+                f"{medal} **{name}** - "
+                f"Lv.{level} ({xp} XP)"
+            )
+
+        embed.description = "\n".join(
+            description
+        )
+
+        await interaction.response.send_message(
+            embed=embed
+        )
+
+    @app_commands.command(
+        name="set-level-role",
+        description="特定のレベル到達時に付与するロールを設定（管理者専用）"
+    )
+    @app_commands.default_permissions(
+        administrator=True
+    )
+    @app_commands.describe(
+        level="ロールを付与するレベル",
+        role="付与するロール"
+    )
+    async def set_level_role(
+        self,
+        interaction: discord.Interaction,
+        level: int,
+        role: discord.Role
+    ):
+        if level < 1:
+            await interaction.response.send_message(
+                "レベルは1以上を指定してください。",
+                ephemeral=True
+            )
+            return
+
+        self.save_level_role(
+            interaction.guild_id,
+            level,
+            role.id
+        )
+
+        await interaction.response.send_message(
+            f"✅ レベル **{level}** 到達時に "
+            f"ロール {role.mention} を付与するよう設定しました。",
+            ephemeral=True
+        )
+
+    @app_commands.command(
+        name="remove-level-role",
+        description="レベルロール設定を解除（管理者専用）"
+    )
+    @app_commands.default_permissions(
+        administrator=True
+    )
+    @app_commands.describe(
+        level="解除するレベル"
+    )
+    async def remove_level_role(
+        self,
+        interaction: discord.Interaction,
+        level: int
+    ):
+        data = self.load_guild_settings()
+
+        guild_key = str(
+            interaction.guild_id
+        )
+
+        if (
+            guild_key in data
+            and "level_roles" in data[guild_key]
+            and str(level) in data[guild_key]["level_roles"]
+        ):
+            del data[guild_key]["level_roles"][
+                str(level)
+            ]
+
+            self.save_json(
+                self.guild_settings_path,
+                data
+            )
+
+            await interaction.response.send_message(
+                f"✅ レベル **{level}** の "
+                f"ロール設定を解除しました。",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"⚠️ レベル **{level}** の設定はありません。",
+                ephemeral=True
             )
 
 
