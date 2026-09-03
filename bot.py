@@ -37,6 +37,7 @@ class Bot(commands.Bot):
 
         await self.load_extension("cogs.rules")
         await self.load_extension("cogs.tickets")
+        await self.load_extension("cogs.leveling")
 
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
