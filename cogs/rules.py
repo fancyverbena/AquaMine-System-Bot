@@ -1,9 +1,88 @@
-import json
 import os
-import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
+
+import jsonstore
+
+DEFAULT_CONFIG = {
+    "title": "サーバールール",
+    "description": "このサーバーを利用する際のルールです。",
+    "color": "#3498db",
+    "fields": [],
+    "footer": ""
+}
+
+SAMPLE_CONFIG = {
+    "title": "サーバールール",
+    "description": "このサーバーを利用する際のルールです。",
+    "color": "#3498db",
+    "fields": [
+        {
+            "name": "1. 敬語の使用",
+            "value": "メンバー同士で敬語を使用してください。"
+        },
+        {
+            "name": "2. NSFW禁止",
+            "value": "NSFWコンテンツの投稿は禁止です。"
+        }
+    ],
+    "footer": "ルールは予告なく変更されることがあります。"
+}
+
+# Embedの制限 (フィールド値1024文字 / 1つのEmbedは25フィールドまで /
+# 全体の文字数6000文字まで) に収まるよう分割するための上限
+MAX_FIELD_VALUE = 1024
+MAX_FIELDS_PER_EMBED = 25
+MAX_EMBED_TOTAL = 6000
+
+
+def parse_color(value) -> discord.Color:
+    """設定ファイルの color を discord.Color に変換する。
+
+    "#3498db" / "3498db" / 数値 に対応し、不正な値はデフォルト色に
+    フォールバックする。
+    """
+    try:
+        if isinstance(value, int):
+            return discord.Color(value)
+
+        if isinstance(value, str):
+            text = value.strip()
+
+            if text.startswith("#"):
+                text = text[1:]
+
+            return discord.Color(int(text, 16))
+
+    except (ValueError, TypeError):
+        pass
+
+    return discord.Color.blurple()
+
+
+def split_field_value(value: str):
+    """1024文字を超えるフィールド値を複数に分割する。"""
+    if len(value) <= MAX_FIELD_VALUE:
+        return [value]
+
+    chunks = []
+
+    rest = value
+
+    while len(rest) > MAX_FIELD_VALUE:
+        cut = rest.rfind("\n", 0, MAX_FIELD_VALUE)
+
+        if cut <= 0:
+            cut = MAX_FIELD_VALUE
+
+        chunks.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n")
+
+    if rest:
+        chunks.append(rest)
+
+    return chunks
 
 
 class AgreeButtonView(discord.ui.View):
@@ -59,6 +138,14 @@ class AgreeButtonView(discord.ui.View):
             )
             return
 
+        if isinstance(interaction.user, discord.Member) \
+                and role in interaction.user.roles:
+            await interaction.response.send_message(
+                "✅ すでに認証済みです。",
+                ephemeral=True
+            )
+            return
+
         try:
             await interaction.user.add_roles(
                 role,
@@ -82,13 +169,6 @@ class AgreeButtonView(discord.ui.View):
             ephemeral=True
         )
 
-        await asyncio.sleep(5)
-
-        try:
-            await interaction.delete_original_response()
-        except discord.HTTPException:
-            pass
-
 
 class RulesCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -100,144 +180,114 @@ class RulesCog(commands.Cog):
         os.makedirs("config", exist_ok=True)
 
         if not os.path.exists(self.guild_settings_path):
-            self.write_json(
-                self.guild_settings_path,
-                {}
-            )
+            jsonstore.write_json(self.guild_settings_path, {})
 
         if not os.path.exists(self.config_path):
-            sample = {
-                "title": "サーバールール",
-                "description": "このサーバーを利用する際のルールです。",
-                "fields": [
-                    {
-                        "name": "1. 敬語の使用",
-                        "value": "メンバー同士で敬語を使用してください。"
-                    },
-                    {
-                        "name": "2. NSFW禁止",
-                        "value": "NSFWコンテンツの投稿は禁止です。"
-                    }
-                ],
-                "footer": "ルールは予告なく変更されることがあります。"
-            }
-
-            self.write_json(
-                self.config_path,
-                sample
-            )
+            jsonstore.write_json(self.config_path, SAMPLE_CONFIG)
 
         self.config = self.load_config()
 
-    def read_json(self, path: str, default):
-        try:
-            if not os.path.exists(path):
-                self.write_json(path, default)
-                return default
-
-            with open(
-                path,
-                "r",
-                encoding="utf-8"
-            ) as f:
-                content = f.read().strip()
-
-            if not content:
-                self.write_json(path, default)
-                return default
-
-            data = json.loads(content)
-
-            if not isinstance(data, type(default)):
-                self.write_json(path, default)
-                return default
-
-            return data
-
-        except (
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-            OSError
-        ):
-            self.write_json(path, default)
-            return default
-
-    def write_json(self, path: str, data):
-        os.makedirs(
-            os.path.dirname(path),
-            exist_ok=True
-        )
-
-        temp_path = f"{path}.tmp"
-
-        with open(
-            temp_path,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                data,
-                f,
-                indent=2,
-                ensure_ascii=False
+    async def cog_app_command_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError
+    ):
+        if isinstance(error, app_commands.CommandOnCooldown):
+            message = (
+                "⏳ コマンドのクールダウン中です。"
+                f"あと {error.retry_after:.0f} 秒待ってから"
+                "もう一度実行してください。"
+            )
+        else:
+            message = (
+                "⚠️ コマンドの実行中にエラーが発生しました。\n"
+                f"`{type(error).__name__}: {error}`"
             )
 
-        os.replace(
-            temp_path,
-            path
-        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                message,
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True
+            )
 
     def load_config(self) -> dict:
-        default = {
-            "title": "サーバールール",
-            "description": "このサーバーを利用する際のルールです。",
-            "fields": [],
-            "footer": ""
-        }
-
-        return self.read_json(
+        return jsonstore.read_json(
             self.config_path,
-            default
+            DEFAULT_CONFIG
         )
 
-    def make_rules_text(self) -> str:
+    def make_rules_embeds(self):
+        """現在の設定からルール表示用のEmbedリストを作る。
+
+        Embedの制限を超える場合は複数のEmbedに分割する。
+        """
         config = self.config
 
-        lines = []
+        color = parse_color(config.get("color"))
 
-        lines.append(
-            "# " + config.get(
-                "title",
-                "サーバールール"
-            )
+        title = config.get("title", "サーバールール")
+        description = config.get("description") or None
+
+        embeds = []
+        current = discord.Embed(
+            title=title,
+            description=description,
+            color=color
         )
+        current_total = len(title) + len(description or "")
 
-        lines.append("")
+        def flush():
+            nonlocal current, current_total
 
-        if config.get("description"):
-            lines.append(
-                config["description"]
-            )
-            lines.append("")
+            embeds.append(current)
+            current = discord.Embed(color=color)
+            current_total = 0
 
         for field in config.get("fields", []):
-            lines.append(
-                "## " + field.get("name", "")
-            )
-            lines.append(
-                field.get("value", "")
-            )
-            lines.append("")
+            name = field.get("name", "")
+            value = field.get("value", "")
 
-        if config.get("footer"):
-            lines.append(
-                "-# " + config["footer"]
-            )
+            chunks = split_field_value(value)
 
-        return "\n".join(lines)
+            for index, chunk in enumerate(chunks):
+                chunk_name = (
+                    name
+                    if index == 0
+                    else f"{name}（続き）"
+                )
+
+                needed = len(chunk_name) + len(chunk)
+
+                if (
+                    len(current.fields) >= MAX_FIELDS_PER_EMBED
+                    or current_total + needed > MAX_EMBED_TOTAL
+                ):
+                    flush()
+
+                current.add_field(
+                    name=chunk_name,
+                    value=chunk,
+                    inline=False
+                )
+                current_total += needed
+
+        if current.fields or not embeds:
+            embeds.append(current)
+
+        footer = config.get("footer")
+
+        if footer:
+            embeds[-1].set_footer(text=footer)
+
+        return embeds
 
     def get_guild_settings(self, guild_id: int) -> dict:
-        all_settings = self.read_json(
+        all_settings = jsonstore.read_json(
             self.guild_settings_path,
             {}
         )
@@ -252,33 +302,33 @@ class RulesCog(commands.Cog):
         guild_id: int,
         settings: dict
     ):
-        all_settings = self.read_json(
-            self.guild_settings_path,
-            {}
-        )
+        def mutator(all_settings):
+            all_settings[str(guild_id)] = settings
+            return all_settings
 
-        all_settings[str(guild_id)] = settings
-
-        self.write_json(
+        jsonstore.update_json(
             self.guild_settings_path,
-            all_settings
+            {},
+            mutator
         )
 
     @app_commands.command(
         name="accept-rules",
         description="サーバールールを表示し、同意します。"
     )
+    @app_commands.checks.cooldown(1, 30.0)
     async def accept_rules(
         self,
         interaction: discord.Interaction
     ):
-        text = self.make_rules_text()
+        # 設定ファイルの編集を再起動なしで反映するため毎回読み直す
+        self.config = self.load_config()
+
+        embeds = self.make_rules_embeds()
         view = AgreeButtonView()
 
         await interaction.response.send_message(
-            "以下のルールをお読みいただき、"
-            "同意される場合は「同意する」ボタンを押してください。\n\n"
-            + text,
+            embeds=embeds,
             view=view
         )
 
@@ -287,6 +337,9 @@ class RulesCog(commands.Cog):
         description="ルール同意時に付与するロールを設定します（管理者専用）"
     )
     @app_commands.default_permissions(
+        administrator=True
+    )
+    @app_commands.checks.has_permissions(
         administrator=True
     )
     @app_commands.describe(

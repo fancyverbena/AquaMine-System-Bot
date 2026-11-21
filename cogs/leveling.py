@@ -1,14 +1,54 @@
-import json
 import os
 import random
 import sqlite3
 import time
+from contextlib import closing
+
 import discord
 from discord.ext import commands
 from discord import app_commands
 
+import jsonstore
+
 DB_PATH = "data/leveling.db"
 GUILD_SETTINGS_PATH = "config/guild_settings.json"
+
+
+def calc_xp_for_level(level: int) -> int:
+    """そのレベルに到達するために必要な累計XP。"""
+    return (
+        5 * (level ** 2)
+        + 50 * level
+        + 100
+    )
+
+
+def current_level_baseline(level: int) -> int:
+    """現在のレベルの開始時点の累計XP。
+
+    レベル0の開始は 0 XP (calc_xp_for_level(0) = 100 は
+    レベル0→1の閾値計算に使う値なので、基準にはならない)。
+    """
+    if level <= 0:
+        return 0
+
+    return calc_xp_for_level(level)
+
+
+def calc_level(total_xp: int) -> int:
+    level = 0
+
+    while True:
+        needed = calc_xp_for_level(
+            level + 1
+        )
+
+        if total_xp < needed:
+            break
+
+        level += 1
+
+    return level
 
 
 class LevelingCog(commands.Cog):
@@ -22,156 +62,76 @@ class LevelingCog(commands.Cog):
 
         self.init_db()
 
-        self.cooldown_cache = {}
         self.cooldown_seconds = 30
 
     def init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS user_xp (
-                user_id INTEGER,
-                guild_id INTEGER,
-                xp INTEGER DEFAULT 0,
-                level INTEGER DEFAULT 0,
-                last_message_time REAL DEFAULT 0,
-                PRIMARY KEY (user_id, guild_id)
-            )
-        """)
-
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS user_xp (
+                        user_id INTEGER,
+                        guild_id INTEGER,
+                        xp INTEGER DEFAULT 0,
+                        level INTEGER DEFAULT 0,
+                        last_message_time REAL DEFAULT 0,
+                        PRIMARY KEY (user_id, guild_id)
+                    )
+                """)
 
         print("✅ レベリングDBを初期化しました。")
 
     def load_guild_settings(self):
-        if not os.path.exists(self.guild_settings_path):
-            self.save_json(
-                self.guild_settings_path,
-                {}
-            )
-            return {}
-
-        try:
-            with open(
-                self.guild_settings_path,
-                "r",
-                encoding="utf-8"
-            ) as f:
-                content = f.read().strip()
-
-            if not content:
-                self.save_json(
-                    self.guild_settings_path,
-                    {}
-                )
-                return {}
-
-            data = json.loads(content)
-
-            if not isinstance(data, dict):
-                self.save_json(
-                    self.guild_settings_path,
-                    {}
-                )
-                return {}
-
-            return data
-
-        except (
-            json.JSONDecodeError,
-            UnicodeDecodeError,
-            OSError
-        ):
-            self.save_json(
-                self.guild_settings_path,
-                {}
-            )
-            return {}
-
-    def save_json(self, path, data):
-        directory = os.path.dirname(path)
-
-        if directory:
-            os.makedirs(
-                directory,
-                exist_ok=True
-            )
-
-        temp_path = f"{path}.tmp"
-
-        with open(
-            temp_path,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                data,
-                f,
-                indent=2,
-                ensure_ascii=False
-            )
-
-        os.replace(
-            temp_path,
-            path
+        return jsonstore.read_json(
+            self.guild_settings_path,
+            {}
         )
 
     def get_user_data(
         self,
         user_id: int,
-        guild_id: int
+        guild_id: int,
+        create: bool = True
     ):
-        conn = sqlite3.connect(
-            self.db_path
-        )
-        c = conn.cursor()
-
-        c.execute(
-            """
-            SELECT xp, level, last_message_time
-            FROM user_xp
-            WHERE user_id = ?
-            AND guild_id = ?
-            """,
-            (
-                user_id,
-                guild_id
-            )
-        )
-
-        result = c.fetchone()
-
-        if result is None:
-            c.execute(
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            result = conn.execute(
                 """
-                INSERT INTO user_xp
-                (
-                    user_id,
-                    guild_id,
-                    xp,
-                    level,
-                    last_message_time
-                )
-                VALUES (?, ?, 0, 0, 0)
+                SELECT xp, level, last_message_time
+                FROM user_xp
+                WHERE user_id = ?
+                AND guild_id = ?
                 """,
                 (
                     user_id,
                     guild_id
                 )
-            )
+            ).fetchone()
 
-            conn.commit()
-            conn.close()
+            if result is None:
+                if create:
+                    with conn:
+                        conn.execute(
+                            """
+                            INSERT INTO user_xp
+                            (
+                                user_id,
+                                guild_id,
+                                xp,
+                                level,
+                                last_message_time
+                            )
+                            VALUES (?, ?, 0, 0, 0)
+                            """,
+                            (
+                                user_id,
+                                guild_id
+                            )
+                        )
 
-            return {
-                "xp": 0,
-                "level": 0,
-                "last_message_time": 0
-            }
-
-        conn.close()
+                return {
+                    "xp": 0,
+                    "level": 0,
+                    "last_message_time": 0
+                }
 
         return {
             "xp": result[0],
@@ -187,64 +147,50 @@ class LevelingCog(commands.Cog):
         level: int,
         last_time: float
     ):
-        conn = sqlite3.connect(
-            self.db_path
-        )
-        c = conn.cursor()
-
-        c.execute(
-            """
-            UPDATE user_xp
-            SET xp = ?,
-                level = ?,
-                last_message_time = ?
-            WHERE user_id = ?
-            AND guild_id = ?
-            """,
-            (
-                xp,
-                level,
-                last_time,
-                user_id,
-                guild_id
-            )
-        )
-
-        conn.commit()
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE user_xp
+                    SET xp = ?,
+                        level = ?,
+                        last_message_time = ?
+                    WHERE user_id = ?
+                    AND guild_id = ?
+                    """,
+                    (
+                        xp,
+                        level,
+                        last_time,
+                        user_id,
+                        guild_id
+                    )
+                )
 
     def get_rank(
         self,
         user_id: int,
         guild_id: int
     ) -> int:
-        conn = sqlite3.connect(
-            self.db_path
-        )
-        c = conn.cursor()
-
-        c.execute(
-            """
-            SELECT COUNT(*) + 1
-            FROM user_xp
-            WHERE guild_id = ?
-            AND xp > (
-                SELECT xp
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            result = conn.execute(
+                """
+                SELECT COUNT(*) + 1
                 FROM user_xp
-                WHERE user_id = ?
-                AND guild_id = ?
-            )
-            """,
-            (
-                guild_id,
-                user_id,
-                guild_id
-            )
-        )
-
-        result = c.fetchone()
-
-        conn.close()
+                WHERE guild_id = ?
+                AND xp > (
+                    SELECT xp
+                    FROM user_xp
+                    WHERE user_id = ?
+                    AND guild_id = ?
+                )
+                """,
+                (
+                    guild_id,
+                    user_id,
+                    guild_id
+                )
+            ).fetchone()
 
         return result[0] if result else 1
 
@@ -253,28 +199,20 @@ class LevelingCog(commands.Cog):
         guild_id: int,
         limit: int = 10
     ):
-        conn = sqlite3.connect(
-            self.db_path
-        )
-        c = conn.cursor()
-
-        c.execute(
-            """
-            SELECT user_id, xp, level
-            FROM user_xp
-            WHERE guild_id = ?
-            ORDER BY xp DESC
-            LIMIT ?
-            """,
-            (
-                guild_id,
-                limit
-            )
-        )
-
-        result = c.fetchall()
-
-        conn.close()
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            result = conn.execute(
+                """
+                SELECT user_id, xp, level
+                FROM user_xp
+                WHERE guild_id = ?
+                ORDER BY xp DESC
+                LIMIT ?
+                """,
+                (
+                    guild_id,
+                    limit
+                )
+            ).fetchall()
 
         return result
 
@@ -282,55 +220,21 @@ class LevelingCog(commands.Cog):
         self,
         level: int
     ) -> int:
-        return (
-            5 * (level ** 2)
-            + 50 * level
-            + 100
-        )
+        return calc_xp_for_level(level)
 
     def calc_level(
         self,
         total_xp: int
     ) -> int:
-        level = 0
-
-        while True:
-            needed = self.calc_xp_for_level(
-                level + 1
-            )
-
-            if total_xp < needed:
-                break
-
-            level += 1
-
-        return level
+        return calc_level(total_xp)
 
     def get_level_up_xp(
         self,
         level: int
     ) -> int:
-        return self.calc_xp_for_level(
+        return calc_xp_for_level(
             level + 1
         )
-
-    def is_spam(
-        self,
-        user_id: int,
-        guild_id: int
-    ) -> bool:
-        now = time.time()
-        key = f"{user_id}_{guild_id}"
-
-        if key in self.cooldown_cache:
-            last_time = self.cooldown_cache[key]
-
-            if now - last_time < self.cooldown_seconds:
-                return True
-
-        self.cooldown_cache[key] = now
-
-        return False
 
     def get_level_roles(
         self,
@@ -354,24 +258,56 @@ class LevelingCog(commands.Cog):
         level: int,
         role_id: int
     ):
-        data = self.load_guild_settings()
+        def mutator(data):
+            guild_key = str(guild_id)
 
-        guild_key = str(guild_id)
+            if guild_key not in data:
+                data[guild_key] = {}
 
-        if guild_key not in data:
-            data[guild_key] = {}
+            if "level_roles" not in data[guild_key]:
+                data[guild_key]["level_roles"] = {}
 
-        if "level_roles" not in data[guild_key]:
-            data[guild_key]["level_roles"] = {}
+            data[guild_key]["level_roles"][
+                str(level)
+            ] = str(role_id)
 
-        data[guild_key]["level_roles"][
-            str(level)
-        ] = str(role_id)
+            return data
 
-        self.save_json(
+        jsonstore.update_json(
             self.guild_settings_path,
-            data
+            {},
+            mutator
         )
+
+    def remove_level_role_setting(
+        self,
+        guild_id: int,
+        level: int
+    ) -> bool:
+        removed = []
+
+        def mutator(data):
+            guild_key = str(guild_id)
+
+            if (
+                guild_key in data
+                and "level_roles" in data[guild_key]
+                and str(level) in data[guild_key]["level_roles"]
+            ):
+                del data[guild_key]["level_roles"][
+                    str(level)
+                ]
+                removed.append(True)
+
+            return data
+
+        jsonstore.update_json(
+            self.guild_settings_path,
+            {},
+            mutator
+        )
+
+        return bool(removed)
 
     async def check_and_assign_roles(
         self,
@@ -430,16 +366,17 @@ class LevelingCog(commands.Cog):
         guild = message.guild
         user = message.author
 
-        if self.is_spam(
-            user.id,
-            guild.id
-        ):
-            return
-
         data = self.get_user_data(
             user.id,
             guild.id
         )
+
+        now = time.time()
+
+        # スパム防止クールダウンはDBの最終投稿時刻で判定する
+        # (Botを再起動してもリセットされず、メモリも消費しない)
+        if now - data["last_message_time"] < self.cooldown_seconds:
+            return
 
         current_xp = data["xp"]
         current_level = data["level"]
@@ -458,8 +395,6 @@ class LevelingCog(commands.Cog):
         level_up = (
             new_level > current_level
         )
-
-        now = time.time()
 
         self.update_user_data(
             user.id,
@@ -491,12 +426,21 @@ class LevelingCog(commands.Cog):
         self,
         interaction: discord.Interaction
     ):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "⚠️ このコマンドはサーバー内でのみ使用できます。",
+                ephemeral=True
+            )
+            return
+
         user = interaction.user
         guild = interaction.guild
 
+        # 参照だけではDBに0 XPの行を作らない
         data = self.get_user_data(
             user.id,
-            guild.id
+            guild.id,
+            create=False
         )
 
         rank = self.get_rank(
@@ -511,7 +455,7 @@ class LevelingCog(commands.Cog):
             level
         )
 
-        current_level_xp = self.calc_xp_for_level(
+        current_level_xp = current_level_baseline(
             level
         )
 
@@ -573,6 +517,13 @@ class LevelingCog(commands.Cog):
         self,
         interaction: discord.Interaction
     ):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "⚠️ このコマンドはサーバー内でのみ使用できます。",
+                ephemeral=True
+            )
+            return
+
         guild = interaction.guild
 
         top_users = self.get_top_users(
@@ -638,6 +589,9 @@ class LevelingCog(commands.Cog):
     @app_commands.default_permissions(
         administrator=True
     )
+    @app_commands.checks.has_permissions(
+        administrator=True
+    )
     @app_commands.describe(
         level="ロールを付与するレベル",
         role="付与するロール"
@@ -648,6 +602,13 @@ class LevelingCog(commands.Cog):
         level: int,
         role: discord.Role
     ):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "⚠️ このコマンドはサーバー内でのみ使用できます。",
+                ephemeral=True
+            )
+            return
+
         if level < 1:
             await interaction.response.send_message(
                 "レベルは1以上を指定してください。",
@@ -674,6 +635,9 @@ class LevelingCog(commands.Cog):
     @app_commands.default_permissions(
         administrator=True
     )
+    @app_commands.checks.has_permissions(
+        administrator=True
+    )
     @app_commands.describe(
         level="解除するレベル"
     )
@@ -682,26 +646,19 @@ class LevelingCog(commands.Cog):
         interaction: discord.Interaction,
         level: int
     ):
-        data = self.load_guild_settings()
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "⚠️ このコマンドはサーバー内でのみ使用できます。",
+                ephemeral=True
+            )
+            return
 
-        guild_key = str(
-            interaction.guild_id
+        removed = self.remove_level_role_setting(
+            interaction.guild_id,
+            level
         )
 
-        if (
-            guild_key in data
-            and "level_roles" in data[guild_key]
-            and str(level) in data[guild_key]["level_roles"]
-        ):
-            del data[guild_key]["level_roles"][
-                str(level)
-            ]
-
-            self.save_json(
-                self.guild_settings_path,
-                data
-            )
-
+        if removed:
             await interaction.response.send_message(
                 f"✅ レベル **{level}** の "
                 f"ロール設定を解除しました。",

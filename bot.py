@@ -21,7 +21,6 @@ else:
     print("⚠️ GUILD_ID が設定されていません。グローバル同期になります。")
 
 intents = discord.Intents.default()
-intents.message_content = True
 intents.guilds = True
 intents.members = True
 
@@ -47,17 +46,11 @@ class Bot(commands.Bot):
 
             print(f"✅ コマンドをギルド {GUILD_ID} に同期しました。")
             print(f"📋 登録コマンド: {[cmd.name for cmd in synced]}")
-
-            cmds = await self.tree.fetch_commands(guild=guild)
-            print(f"📋 Discord側の登録コマンド: {[cmd.name for cmd in cmds]}")
         else:
             synced = await self.tree.sync()
 
             print("✅ コマンドをグローバルに同期しました。")
             print(f"📋 登録コマンド: {[cmd.name for cmd in synced]}")
-
-            cmds = await self.tree.fetch_commands()
-            print(f"📋 Discord側の登録コマンド: {[cmd.name for cmd in cmds]}")
 
 
 bot = Bot(

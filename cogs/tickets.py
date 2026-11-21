@@ -1,12 +1,28 @@
-import json
 import os
+import time
 
 import discord
 from discord.ext import commands
 from discord import app_commands
 
+import jsonstore
+from ticket_store import TicketStore
 
 TICKET_CONFIG_PATH = "config/ticket_settings.json"
+TRANSCRIPT_DIR = "data/transcripts"
+
+
+def parse_topic_owner_id(channel) -> int:
+    """旧方式の topic (`ticket_owner:<id>`) から所有者IDを取り出す。"""
+    topic = getattr(channel, "topic", None)
+
+    if topic and topic.startswith("ticket_owner:"):
+        try:
+            return int(topic.split(":", 1)[1])
+        except ValueError:
+            return None
+
+    return None
 
 
 class TicketView(discord.ui.View):
@@ -75,11 +91,26 @@ class TicketView(discord.ui.View):
 
         existing = None
 
-        for channel in category.channels:
-            if channel.name.startswith("ticket-"):
-                if channel.topic == f"ticket_owner:{user.id}":
-                    existing = channel
-                    break
+        # 既存チケットの確認はDBを優先し、旧方式のtopicにも対応する
+        row = cog.store.get_open_ticket_by_owner(
+            guild.id,
+            user.id
+        )
+
+        if row is not None:
+            existing_channel = guild.get_channel(
+                row["channel_id"]
+            )
+
+            if isinstance(existing_channel, discord.TextChannel):
+                existing = existing_channel
+
+        if existing is None:
+            for channel in category.channels:
+                if channel.name.startswith("ticket-"):
+                    if parse_topic_owner_id(channel) == user.id:
+                        existing = channel
+                        break
 
         if existing:
             await interaction.response.send_message(
@@ -143,6 +174,14 @@ class TicketView(discord.ui.View):
             )
             return
 
+        cog.store.create_ticket(
+            channel_id=channel.id,
+            guild_id=guild.id,
+            owner_id=user.id,
+            ticket_type="other",
+            now=time.time()
+        )
+
         embed = discord.Embed(
             title="🎫 サポートチケット",
             description=(
@@ -171,6 +210,7 @@ class TicketView(discord.ui.View):
                 view=close_view
             )
         except discord.HTTPException as e:
+            cog.store.delete_ticket(channel.id)
             await channel.delete(reason="チケットメッセージ送信失敗")
             await interaction.response.send_message(
                 f"⚠️ チケットメッセージの送信に失敗しました。\n`{e}`",
@@ -246,13 +286,7 @@ class CloseView(discord.ui.View):
             and support_role in interaction.user.roles
         )
 
-        owner_id = None
-
-        if channel.topic and channel.topic.startswith("ticket_owner:"):
-            try:
-                owner_id = int(channel.topic.split(":", 1)[1])
-            except ValueError:
-                owner_id = None
+        owner_id = cog.get_owner_id(channel)
 
         is_owner = interaction.user.id == owner_id
 
@@ -307,10 +341,11 @@ class ConfirmCloseView(discord.ui.View):
                     f"{content}"
                 )
 
-            os.makedirs("transcripts", exist_ok=True)
+            # トランスクリプトはDockerのvolume内 (data/) に保存する
+            os.makedirs(TRANSCRIPT_DIR, exist_ok=True)
 
             filename = (
-                f"transcripts/"
+                f"{TRANSCRIPT_DIR}/"
                 f"{self.channel.name}_"
                 f"{interaction.guild.id}.txt"
             )
@@ -342,6 +377,8 @@ class ConfirmCloseView(discord.ui.View):
                             )
                         except discord.HTTPException:
                             pass
+
+                cog.store.delete_ticket(self.channel.id)
 
             await interaction.followup.send(
                 "✅ チケットを閉鎖します。\n"
@@ -392,6 +429,7 @@ class TicketCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.config_path = TICKET_CONFIG_PATH
+        self.store = TicketStore()
 
         os.makedirs(
             os.path.dirname(self.config_path),
@@ -399,62 +437,13 @@ class TicketCog(commands.Cog):
         )
 
         if not os.path.exists(self.config_path):
-            self._write_config({})
-
-    def _read_config(self) -> dict:
-        try:
-            with open(
-                self.config_path,
-                "r",
-                encoding="utf-8"
-            ) as f:
-                content = f.read().strip()
-
-            if not content:
-                return {}
-
-            data = json.loads(content)
-
-            if not isinstance(data, dict):
-                return {}
-
-            return data
-
-        except (
-            FileNotFoundError,
-            json.JSONDecodeError,
-            UnicodeDecodeError
-        ):
-            self._write_config({})
-            return {}
-
-    def _write_config(self, data: dict):
-        os.makedirs(
-            os.path.dirname(self.config_path),
-            exist_ok=True
-        )
-
-        temp_path = f"{self.config_path}.tmp"
-
-        with open(
-            temp_path,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                data,
-                f,
-                indent=2,
-                ensure_ascii=False
-            )
-
-        os.replace(
-            temp_path,
-            self.config_path
-        )
+            jsonstore.write_json(self.config_path, {})
 
     def get_settings(self, guild_id: int) -> dict:
-        data = self._read_config()
+        data = jsonstore.read_json(
+            self.config_path,
+            {}
+        )
         return data.get(str(guild_id), {})
 
     def save_settings(
@@ -462,17 +451,31 @@ class TicketCog(commands.Cog):
         guild_id: int,
         settings: dict
     ):
-        data = self._read_config()
+        def mutator(data):
+            data[str(guild_id)] = settings
+            return data
 
-        data[str(guild_id)] = settings
+        jsonstore.update_json(
+            self.config_path,
+            {},
+            mutator
+        )
 
-        self._write_config(data)
+    def get_owner_id(self, channel) -> int:
+        """チケットの所有者IDを返す (DB優先、旧topicにフォールバック)。"""
+        row = self.store.get_ticket(channel.id)
+
+        if row is not None:
+            return row["owner_id"]
+
+        return parse_topic_owner_id(channel)
 
     @app_commands.command(
         name="setup-ticket",
         description="チケット機能の初期設定を行います（管理者専用）"
     )
     @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
         category="チケットを作成するカテゴリ",
         support_role="サポートスタッフのロール",
@@ -543,6 +546,7 @@ class TicketCog(commands.Cog):
         description="チケット作成ボタンを送信します（管理者専用）"
     )
     @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
         channel="ボタンを表示するチャンネル"
     )
@@ -600,6 +604,7 @@ class TicketCog(commands.Cog):
         description="スラッシュコマンドを手動同期します（管理者専用）"
     )
     @app_commands.default_permissions(administrator=True)
+    @app_commands.checks.has_permissions(administrator=True)
     async def sync_commands(
         self,
         interaction: discord.Interaction
