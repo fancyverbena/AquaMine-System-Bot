@@ -28,11 +28,11 @@ intents.members = True
 class Bot(commands.Bot):
     async def setup_hook(self):
         from cogs.rules import AgreeButtonView
-        from cogs.tickets import TicketView, CloseView
+        from cogs.tickets import TicketView, TicketControlsView
 
         self.add_view(AgreeButtonView())
         self.add_view(TicketView())
-        self.add_view(CloseView())
+        self.add_view(TicketControlsView())
 
         await self.load_extension("cogs.rules")
         await self.load_extension("cogs.tickets")

@@ -196,5 +196,53 @@ class TicketStoreTest(unittest.TestCase):
         self.assertEqual(len(self.store.list_tickets()), 1)
 
 
+class TicketNamingTest(unittest.TestCase):
+    """チケットのチャンネル名サニタイズ (cogs.tickets)。"""
+
+    @classmethod
+    def setUpClass(cls):
+        from cogs import tickets
+
+        cls.tickets = tickets
+
+    def test_types(self):
+        self.assertEqual(
+            set(self.tickets.TICKET_TYPES),
+            {"question", "report", "whitelist", "other"}
+        )
+
+    def test_sanitize(self):
+        sanitize = self.tickets.sanitize_channel_name
+
+        self.assertEqual(sanitize("Yuu Ma!"), "yuu-ma")
+        self.assertEqual(sanitize("abc_def-123"), "abc_def-123")
+        self.assertEqual(sanitize("!!!"), "")
+        # 日本語のみの名前は空になる (呼び出し側で "user" にフォールバック)
+        self.assertEqual(sanitize("ゆうま"), "")
+
+    def test_channel_name(self):
+        class FakeUser:
+            def __init__(self, name):
+                self.name = name
+
+        name = self.tickets.ticket_channel_name(
+            "whitelist",
+            FakeUser("Yuu Ma!")
+        )
+        self.assertEqual(name, "ticket-whitelist-yuu-ma")
+
+        fallback = self.tickets.ticket_channel_name(
+            "question",
+            FakeUser("ゆうま")
+        )
+        self.assertEqual(fallback, "ticket-question-user")
+
+        long_name = self.tickets.ticket_channel_name(
+            "other",
+            FakeUser("a" * 200)
+        )
+        self.assertLessEqual(len(long_name), 100)
+
+
 if __name__ == "__main__":
     unittest.main()
