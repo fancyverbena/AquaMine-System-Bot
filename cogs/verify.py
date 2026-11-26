@@ -11,7 +11,7 @@ from discord.ext import commands
 
 from app import settings
 from app.config import RULES_PATH
-from app.ui import COLOR_PRIMARY, parse_color, reply_error
+from app.ui import reply_error
 
 DEFAULT_RULES = {
     "title": "📜 サーバールール",
@@ -37,29 +37,71 @@ def load_rules() -> dict:
         return dict(DEFAULT_RULES)
 
 
-def build_rules_embed() -> discord.Embed:
+def build_rules_text() -> str:
+    """ルールを通常メッセージ (Markdownテキスト) として組み立てる。"""
     rules = load_rules()
-    color = parse_color(rules.get("color"), COLOR_PRIMARY)
-    embed = discord.Embed(
-        title=rules.get("title") or "📜 サーバールール",
-        description=rules.get("description") or None,
-        color=color,
-    )
+    lines = []
+
+    lines.append("# " + str(rules.get("title") or "📜 サーバールール"))
+    lines.append("")
+
+    if rules.get("description"):
+        lines.append(str(rules["description"]))
+        lines.append("")
+
     for field in rules.get("fields", []):
         if not isinstance(field, dict):
             continue
-        name = str(field.get("name", ""))[:256]
-        value = str(field.get("value", ""))[:1024]
-        if name and value:
-            embed.add_field(name=name, value=value, inline=False)
+        name = str(field.get("name", ""))
+        value = str(field.get("value", ""))
+        if name:
+            lines.append("## " + name)
+        if value:
+            lines.append(value)
+        lines.append("")
+
     if rules.get("footer"):
-        embed.set_footer(text=str(rules["footer"]))
-    return embed
+        lines.append("-# " + str(rules["footer"]))
+
+    return "\n".join(lines).strip()
+
+
+def split_message(text: str, limit: int = 2000) -> list:
+    """Discord の文字数上限に収まるよう、行境界で分割する。"""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+        # 1行だけで上限を超える場合は強制的に割る
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+
+        candidate = line if not current else current + "\n" + line
+        if len(candidate) > limit:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
 def build_rules_panel():
-    """(embed, view) を返す。/setup のパネル設置からも使う。"""
-    return build_rules_embed(), AgreeView()
+    """(text_chunks, view) を返す。/setup のパネル設置からも使う。
+
+    同意ボタンは最後のチャンクに付ける。
+    """
+    return split_message(build_rules_text()), AgreeView()
 
 
 class AgreeView(discord.ui.View):

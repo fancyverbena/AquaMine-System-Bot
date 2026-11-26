@@ -145,5 +145,27 @@ class TestDatabase(unittest.TestCase):
         self.assertIsNone(self.db.get_open_ticket_by_owner(100, 7))
 
 
+class TestRulesText(unittest.TestCase):
+    def test_build_rules_text_is_plain_markdown(self):
+        from cogs.verify import build_rules_text
+
+        text = build_rules_text()
+        self.assertTrue(text.startswith("# "))
+        self.assertIn("## ", text)
+        self.assertNotIn("\x00", text)
+
+    def test_split_message(self):
+        from cogs.verify import split_message
+
+        self.assertEqual(split_message("短い文"), ["短い文"])
+
+        long_text = "\n".join(f"行{i} " + "あ" * 90 for i in range(60))
+        chunks = split_message(long_text)
+        self.assertGreater(len(chunks), 1)
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk), 2000)
+        self.assertEqual("\n".join(chunks), long_text)
+
+
 if __name__ == "__main__":
     unittest.main()
