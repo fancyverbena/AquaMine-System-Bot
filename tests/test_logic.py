@@ -10,7 +10,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app import settings  # noqa: E402
-from app.db import Database  # noqa: E402
+from app.db import Database, next_vote  # noqa: E402
 from app.ui import progress_bar, sanitize_channel_part  # noqa: E402
 from cogs.automod import (  # noqa: E402
     content_violation,
@@ -32,6 +32,11 @@ from cogs.leveling import (  # noqa: E402
     vc_eligible,
     xp_block_reason,
     xp_threshold,
+)
+from cogs.feedback import (  # noqa: E402
+    FeedbackStatusButton,
+    FeedbackVoteButton,
+    can_transition,
 )
 from cogs.giveaway import (  # noqa: E402
     GiveawayButton,
@@ -1013,6 +1018,213 @@ class TestGiveawayButtonDynamicItem(unittest.TestCase):
         self.assertIsNone(button.template.fullmatch("v2:role:123"))
         self.assertIsNone(button.template.fullmatch("v2:agree"))
         self.assertIsNone(button.template.fullmatch("v2:giveaway:abc"))
+
+
+class TestNextVote(unittest.TestCase):
+    def test_new_vote(self):
+        self.assertEqual(next_vote(None, 1), 1)
+        self.assertEqual(next_vote(None, -1), -1)
+
+    def test_same_side_removes(self):
+        self.assertIsNone(next_vote(1, 1))
+        self.assertIsNone(next_vote(-1, -1))
+
+    def test_opposite_side_switches(self):
+        self.assertEqual(next_vote(1, -1), -1)
+        self.assertEqual(next_vote(-1, 1), 1)
+
+
+class TestFeedbackTransitions(unittest.TestCase):
+    def test_suggestion_valid(self):
+        self.assertTrue(can_transition("suggestion", "pending", "adopted"))
+        self.assertTrue(can_transition("suggestion", "pending", "rejected"))
+
+    def test_suggestion_invalid(self):
+        # 提案に存在しないステータス
+        self.assertFalse(can_transition("suggestion", "pending", "working"))
+        self.assertFalse(can_transition("suggestion", "pending", "fixed"))
+        self.assertFalse(can_transition("suggestion", "pending", "pending"))
+
+    def test_bug_valid(self):
+        self.assertTrue(can_transition("bug", "open", "working"))
+        self.assertTrue(can_transition("bug", "open", "fixed"))
+        self.assertTrue(can_transition("bug", "open", "rejected"))
+        self.assertTrue(can_transition("bug", "working", "fixed"))
+        self.assertTrue(can_transition("bug", "working", "rejected"))
+
+    def test_bug_invalid(self):
+        self.assertFalse(can_transition("bug", "open", "adopted"))
+        self.assertFalse(can_transition("bug", "working", "open"))
+        self.assertFalse(can_transition("bug", "open", "open"))
+
+    def test_terminal_states_reject_everything(self):
+        for kind, terminal in (
+            ("suggestion", "adopted"),
+            ("suggestion", "rejected"),
+            ("bug", "fixed"),
+            ("bug", "rejected"),
+        ):
+            for target in ("pending", "open", "working", "adopted", "fixed", "rejected"):
+                self.assertFalse(
+                    can_transition(kind, terminal, target),
+                    f"{kind} {terminal} -> {target}",
+                )
+
+    def test_unknown_kind(self):
+        self.assertFalse(can_transition("unknown", "pending", "adopted"))
+
+
+class TestFeedbackDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _suggestion(self, guild_id=100, author_id=7, content="新しいイベントがほしい"):
+        return self.db.create_feedback(
+            guild_id, "suggestion", author_id, "", content, 555, 1000.0
+        )
+
+    def _bug(self, guild_id=100, author_id=8, title="ログインできない"):
+        return self.db.create_feedback(
+            guild_id, "bug", author_id, title, "手順の詳細", 666, 1001.0
+        )
+
+    def test_create_get_round_trip_suggestion(self):
+        fid = self._suggestion()
+        row = self.db.get_feedback(fid)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["kind"], "suggestion")
+        self.assertEqual(row["author_id"], 7)
+        self.assertEqual(row["title"], "")
+        self.assertEqual(row["content"], "新しいイベントがほしい")
+        self.assertEqual(row["channel_id"], 555)
+        self.assertIsNone(row["message_id"])
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["created_at"], 1000.0)
+        self.assertIsNone(self.db.get_feedback(99999))
+
+    def test_create_get_round_trip_bug(self):
+        fid = self._bug()
+        row = self.db.get_feedback(fid)
+        self.assertEqual(row["kind"], "bug")
+        self.assertEqual(row["title"], "ログインできない")
+        self.assertEqual(row["status"], "open")
+
+    def test_message_and_status_updates(self):
+        fid = self._suggestion()
+        self.db.set_feedback_message(fid, 777)
+        self.assertEqual(self.db.get_feedback(fid)["message_id"], 777)
+        self.db.set_feedback_status(fid, "adopted")
+        self.assertEqual(self.db.get_feedback(fid)["status"], "adopted")
+
+    def test_votes_toggle_switch_remove(self):
+        fid = self._suggestion()
+        self.assertEqual(self.db.count_votes(fid), (0, 0))
+        # 投票 → 集計に反映
+        self.assertEqual(self.db.set_vote(fid, 1, 1), (1, 0))
+        self.assertEqual(self.db.set_vote(fid, 2, 1), (2, 0))
+        self.assertEqual(self.db.set_vote(fid, 3, -1), (2, 1))
+        # 反対側へ切り替え
+        self.assertEqual(self.db.set_vote(fid, 1, -1), (1, 2))
+        # 同じ側をもう一度 → 取り消し
+        self.assertEqual(self.db.set_vote(fid, 1, -1), (1, 1))
+        self.assertEqual(self.db.set_vote(fid, 2, 1), (0, 1))
+        self.assertEqual(self.db.count_votes(fid), (0, 1))
+        # 投稿者本人も投票できる (author_id=7)
+        self.assertEqual(self.db.set_vote(fid, 7, 1), (1, 1))
+        # 他の投稿には影響しない
+        other = self._suggestion()
+        self.assertEqual(self.db.count_votes(other), (0, 0))
+
+    def test_list_filtering(self):
+        s1 = self._suggestion()
+        b1 = self._bug()
+        s2 = self._suggestion(content="別の提案")
+        other_guild = self._suggestion(guild_id=200)
+
+        all_rows = self.db.list_feedback(100)
+        self.assertEqual([r["id"] for r in all_rows], [s2, b1, s1])
+
+        suggestions = self.db.list_feedback(100, kind="suggestion")
+        self.assertEqual([r["id"] for r in suggestions], [s2, s1])
+
+        bugs = self.db.list_feedback(100, kind="bug")
+        self.assertEqual([r["id"] for r in bugs], [b1])
+
+        limited = self.db.list_feedback(100, limit=2)
+        self.assertEqual([r["id"] for r in limited], [s2, b1])
+
+        self.assertEqual(
+            [r["id"] for r in self.db.list_feedback(200)], [other_guild]
+        )
+        self.assertEqual(self.db.list_feedback(300), [])
+
+
+class TestFeedbackSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_channel_ids_default_unset(self):
+        self.assertEqual(settings.get_suggestion_channel_id(1), 0)
+        self.assertEqual(settings.get_bug_channel_id(1), 0)
+
+    def test_channel_ids_round_trip(self):
+        settings.set_value(1, settings.SUGGESTION_CHANNEL_ID, 123)
+        settings.set_value(1, settings.BUG_CHANNEL_ID, 456)
+        self.assertEqual(settings.get_suggestion_channel_id(1), 123)
+        self.assertEqual(settings.get_bug_channel_id(1), 456)
+        # ギルドごとに独立
+        self.assertEqual(settings.get_suggestion_channel_id(2), 0)
+
+    def test_channel_ids_corrupt_fallback(self):
+        settings.set_value(1, settings.SUGGESTION_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_suggestion_channel_id(1), 0)
+        settings.set_value(1, settings.BUG_CHANNEL_ID, -5)
+        self.assertEqual(settings.get_bug_channel_id(1), 0)
+
+
+class TestFeedbackButtonsDynamicItem(unittest.TestCase):
+    def test_vote_button_custom_id_and_template(self):
+        button = FeedbackVoteButton(42, "up", 3)
+        self.assertEqual(button.custom_id, "v2:fbvote:42:up")
+        self.assertEqual(button.feedback_id, 42)
+        self.assertEqual(button.side, "up")
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:fbvote:123:down")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["feedback_id"], "123")
+        self.assertEqual(match["side"], "down")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:123"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:123"))
+        self.assertIsNone(button.template.fullmatch("v2:fbstatus:42:adopted"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:42:left"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:abc:up"))
+
+    def test_status_button_custom_id_and_template(self):
+        button = FeedbackStatusButton(42, "adopted")
+        self.assertEqual(button.custom_id, "v2:fbstatus:42:adopted")
+        self.assertEqual(button.feedback_id, 42)
+        self.assertEqual(button.status_key, "adopted")
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:fbstatus:7:working")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["feedback_id"], "7")
+        self.assertEqual(match["status"], "working")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:42"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:42"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:42:up"))
+        self.assertIsNone(button.template.fullmatch("v2:fbstatus:abc:fixed"))
 
 
 if __name__ == "__main__":
