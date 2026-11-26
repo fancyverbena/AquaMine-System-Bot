@@ -15,6 +15,7 @@ XP_MIN = "xp_min"
 XP_MAX = "xp_max"
 XP_COOLDOWN_SECONDS = "xp_cooldown_seconds"
 XP_MIN_LENGTH = "xp_min_length"
+VC_XP_PER_MINUTE = "vc_xp_per_minute"
 AUTOMOD_ENABLED = "automod_enabled"
 AUTOMOD_NGWORDS = "automod_ngwords"
 AUTOMOD_LOG_CHANNEL_ID = "automod_log_channel_id"
@@ -22,6 +23,15 @@ AUTOMOD_MENTION_LIMIT = "automod_mention_limit"
 AUTOMOD_INVITES_ENABLED = "automod_invites_enabled"
 AUTOMOD_EXEMPT_CHANNEL_IDS = "automod_exempt_channel_ids"
 AUTOMOD_AD_CHANNEL_IDS = "automod_ad_channel_ids"
+ROLE_PANEL_ROLE_IDS = "role_panel_role_ids"
+ROLE_PANEL_EXCLUSIVE = "role_panel_exclusive"
+SUGGESTION_CHANNEL_ID = "suggestion_channel_id"
+BUG_CHANNEL_ID = "bug_channel_id"
+BUMP_REMINDER_ENABLED = "bump_reminder_enabled"
+BUMP_NOTIFY_ROLE_ID = "bump_notify_role_id"
+BACKUP_CHANNEL_ID = "backup_channel_id"
+BACKUP_INTERVAL_HOURS = "backup_interval_hours"
+BACKUP_LAST_AT = "backup_last_at"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -34,10 +44,19 @@ DEFAULT_XP_MIN_LENGTH = 3
 XP_HARD_MAX = 10000
 COOLDOWN_HARD_MAX = 3600
 MIN_LENGTH_HARD_MAX = 200
+DEFAULT_VC_XP_PER_MINUTE = 2
+VC_XP_HARD_MAX = 1000
 
 # 自動モデレーション設定のデフォルトと許容範囲
 DEFAULT_AUTOMOD_MENTION_LIMIT = 5
 MENTION_LIMIT_HARD_MAX = 50
+
+# ロールパネルの上限 (ボタンの並び順 = リストの順序)
+MAX_ROLE_PANEL_ROLES = 20
+
+# DB 自動バックアップのデフォルトと許容範囲 (間隔は時間単位、0 で自動投稿オフ)
+DEFAULT_BACKUP_INTERVAL_HOURS = 24
+BACKUP_INTERVAL_HARD_MAX = 168
 
 # NG ワードのデフォルトセット。ギルドが独自のリストを保存するまでは
 # これが使われる (追加・削除した時点で、その内容がギルドのリストとして
@@ -110,6 +129,14 @@ def get_xp_config(guild_id: int) -> dict:
         "xp_cooldown_seconds": cooldown,
         "xp_min_length": min_length,
     }
+
+
+def get_vc_xp_per_minute(guild_id: int) -> int:
+    """VC 滞在で1分ごとに得る XP (0 で VC XP 無効、範囲外はデフォルト)。"""
+    value = _get_int(guild_id, VC_XP_PER_MINUTE, DEFAULT_VC_XP_PER_MINUTE)
+    if not (0 <= value <= VC_XP_HARD_MAX):
+        return DEFAULT_VC_XP_PER_MINUTE
+    return value
 
 
 def get_automod_enabled(guild_id: int) -> bool:
@@ -187,6 +214,80 @@ def get_automod_ad_channel_ids(guild_id: int) -> list:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def get_role_panel_role_ids(guild_id: int) -> list:
+    """ロールパネルに並べるロール ID のリスト (順序 = ボタンの並び順)。"""
+    ids = get(guild_id, ROLE_PANEL_ROLE_IDS, [])
+    if not isinstance(ids, list):
+        return []
+    result = []
+    for item in ids:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def get_suggestion_channel_id(guild_id: int) -> int:
+    """提案箱の投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, SUGGESTION_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_bug_channel_id(guild_id: int) -> int:
+    """バグ報告の投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, BUG_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_bump_reminder_enabled(guild_id: int) -> bool:
+    """Bump リマインダーの有効/無効 (既定は有効、壊れた値は有効扱い)。
+
+    検知は受動的で、bump の成功メッセージを見たときだけ予約する。
+    """
+    value = get(guild_id, BUMP_REMINDER_ENABLED, True)
+    return value if isinstance(value, bool) else True
+
+
+def get_bump_notify_role_id(guild_id: int) -> int:
+    """Bump リマインダーでメンションするロール ID (0 は未設定)。"""
+    value = _get_int(guild_id, BUMP_NOTIFY_ROLE_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_backup_channel_id(guild_id: int) -> int:
+    """DB バックアップの投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, BACKUP_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_backup_interval_hours(guild_id: int) -> int:
+    """自動バックアップの間隔 (時間)。0 で自動投稿オフ、範囲外はデフォルト。"""
+    value = _get_int(
+        guild_id, BACKUP_INTERVAL_HOURS, DEFAULT_BACKUP_INTERVAL_HOURS
+    )
+    if not (0 <= value <= BACKUP_INTERVAL_HARD_MAX):
+        return DEFAULT_BACKUP_INTERVAL_HOURS
+    return value
+
+
+def get_backup_last_at(guild_id: int) -> float:
+    """最後に自動/手動バックアップを投稿先へ送った時刻 (未実施は 0)。"""
+    try:
+        return float(get(guild_id, BACKUP_LAST_AT, 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_role_panel_exclusive(guild_id: int) -> bool:
+    """ロールパネルの排他モード (既定は無効、壊れた値は無効扱い)。
+
+    有効時はパネルのロールを付けると、他のパネルロールが外れる。
+    """
+    value = get(guild_id, ROLE_PANEL_EXCLUSIVE, False)
+    return value if isinstance(value, bool) else False
 
 
 def get_level_roles(guild_id: int) -> dict:

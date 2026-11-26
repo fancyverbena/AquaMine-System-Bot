@@ -6,6 +6,13 @@
   tickets(channel_id, guild_id, owner_id, assignee_id, ticket_type,
           subject, message_id, created_at, last_activity_at)
   infractions(id, guild_id, user_id, reason, detail, punishment, created_at)
+  giveaways(id, guild_id, channel_id, message_id, host_id, prize,
+            winner_count, ends_at, status, winners, created_at)
+  giveaway_entries(giveaway_id, user_id, entered_at)
+  feedback(id, guild_id, kind, author_id, title, content,
+           channel_id, message_id, status, created_at)
+  feedback_votes(feedback_id, user_id, vote)
+  bump_reminders(guild_id, channel_id, bumper_id, remind_at)
 
 すべてのアクセスは context manager 経由で行い、接続を漏らさない。
 """
@@ -63,6 +70,49 @@ class Database:
                         detail TEXT,
                         punishment TEXT NOT NULL,
                         created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS giveaways (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id INTEGER NOT NULL,
+                        channel_id INTEGER NOT NULL,
+                        message_id INTEGER,
+                        host_id INTEGER NOT NULL,
+                        prize TEXT NOT NULL,
+                        winner_count INTEGER NOT NULL,
+                        ends_at REAL NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        winners TEXT,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS giveaway_entries (
+                        giveaway_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        entered_at REAL NOT NULL,
+                        PRIMARY KEY (giveaway_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS feedback (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        author_id INTEGER NOT NULL,
+                        title TEXT NOT NULL DEFAULT '',
+                        content TEXT NOT NULL,
+                        channel_id INTEGER NOT NULL,
+                        message_id INTEGER,
+                        status TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS feedback_votes (
+                        feedback_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        vote INTEGER NOT NULL,
+                        PRIMARY KEY (feedback_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS bump_reminders (
+                        guild_id INTEGER PRIMARY KEY,
+                        channel_id INTEGER NOT NULL,
+                        bumper_id INTEGER,
+                        remind_at REAL NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS tickets (
                         channel_id INTEGER PRIMARY KEY,
@@ -403,6 +453,397 @@ class Database:
                 (guild_id, user_id),
             )
             return cursor.rowcount
+
+    # ---------- giveaways (抽選) ----------
+
+    @staticmethod
+    def _parse_winners(raw) -> list:
+        """winners (JSON 配列文字列) をユーザー ID のリストに戻す。"""
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(value, list):
+            return []
+        result = []
+        for item in value:
+            try:
+                result.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    @classmethod
+    def _giveaway_row(cls, row) -> dict:
+        result = dict(row)
+        result["winners"] = cls._parse_winners(result.get("winners"))
+        return result
+
+    def create_giveaway(
+        self,
+        guild_id: int,
+        channel_id: int,
+        host_id: int,
+        prize: str,
+        winner_count: int,
+        ends_at: float,
+        now: float,
+    ) -> int:
+        """抽選を作成し、新しい行の id を返す (message_id は投稿後に設定)。"""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO giveaways (
+                    guild_id, channel_id, message_id, host_id, prize,
+                    winner_count, ends_at, status, winners, created_at
+                ) VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', NULL, ?)
+                """,
+                (
+                    guild_id,
+                    channel_id,
+                    host_id,
+                    prize,
+                    winner_count,
+                    ends_at,
+                    now,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_giveaway(self, giveaway_id: int):
+        """抽選を1件返す (winners はリスト化済み)。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM giveaways WHERE id = ?",
+                (giveaway_id,),
+            ).fetchone()
+        return self._giveaway_row(row) if row else None
+
+    def set_giveaway_message(self, giveaway_id: int, message_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE giveaways SET message_id = ? WHERE id = ?",
+                (message_id, giveaway_id),
+            )
+
+    def list_active_giveaways(self, guild_id: int):
+        """そのギルドの開催中 (active) の抽選を終了時刻順に返す。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM giveaways
+                WHERE guild_id = ? AND status = 'active'
+                ORDER BY ends_at ASC, id ASC
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [self._giveaway_row(r) for r in rows]
+
+    def list_overdue_giveaways(self, now: float):
+        """終了時刻を過ぎた active な抽選をすべて返す (再起動後の回収用)。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM giveaways
+                WHERE status = 'active' AND ends_at <= ?
+                ORDER BY ends_at ASC, id ASC
+                """,
+                (now,),
+            ).fetchall()
+        return [self._giveaway_row(r) for r in rows]
+
+    def toggle_entry(self, giveaway_id: int, user_id: int, now: float) -> bool:
+        """参加の付け外し。参加状態になったら True、取り消したら False。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM giveaway_entries
+                WHERE giveaway_id = ? AND user_id = ?
+                """,
+                (giveaway_id, user_id),
+            ).fetchone()
+            if row is not None:
+                conn.execute(
+                    """
+                    DELETE FROM giveaway_entries
+                    WHERE giveaway_id = ? AND user_id = ?
+                    """,
+                    (giveaway_id, user_id),
+                )
+                return False
+            conn.execute(
+                """
+                INSERT INTO giveaway_entries (giveaway_id, user_id, entered_at)
+                VALUES (?, ?, ?)
+                """,
+                (giveaway_id, user_id, now),
+            )
+            return True
+
+    def count_entries(self, giveaway_id: int) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS c FROM giveaway_entries WHERE giveaway_id = ?",
+                (giveaway_id,),
+            ).fetchone()
+        return row["c"] if row else 0
+
+    def list_entry_user_ids(self, giveaway_id: int):
+        """参加者のユーザー ID を参加順に返す。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id FROM giveaway_entries
+                WHERE giveaway_id = ?
+                ORDER BY entered_at ASC, user_id ASC
+                """,
+                (giveaway_id,),
+            ).fetchall()
+        return [r["user_id"] for r in rows]
+
+    def finish_giveaway(self, giveaway_id: int, status: str, winners):
+        """抽選を終了状態にし、当選者リスト (ユーザー ID) を保存する。"""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE giveaways SET status = ?, winners = ? WHERE id = ?",
+                (status, json.dumps([int(w) for w in (winners or [])]), giveaway_id),
+            )
+
+    # ---------- feedback (提案箱・バグ報告) ----------
+
+    def create_feedback(
+        self,
+        guild_id: int,
+        kind: str,
+        author_id: int,
+        title: str,
+        content: str,
+        channel_id: int,
+        now: float,
+    ) -> int:
+        """フィードバックを1件作成し、新しい行の id を返す。
+
+        初期ステータスは kind で決まる (提案='pending'、バグ='open')。
+        message_id は投稿後に set_feedback_message で設定する。
+        """
+        status = "pending" if kind == "suggestion" else "open"
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO feedback (
+                    guild_id, kind, author_id, title, content,
+                    channel_id, message_id, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    guild_id,
+                    kind,
+                    author_id,
+                    title or "",
+                    content,
+                    channel_id,
+                    status,
+                    now,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_feedback(self, feedback_id: int):
+        """フィードバックを1件 dict で返す。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM feedback WHERE id = ?",
+                (feedback_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_feedback_message(self, feedback_id: int, message_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE feedback SET message_id = ? WHERE id = ?",
+                (message_id, feedback_id),
+            )
+
+    def set_feedback_status(self, feedback_id: int, status: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE feedback SET status = ? WHERE id = ?",
+                (status, feedback_id),
+            )
+
+    def list_feedback(self, guild_id: int, kind: str = None, limit: int = 10):
+        """そのギルドのフィードバックを新しい順に返す (kind で絞り込み可)。"""
+        with self._conn() as conn:
+            if kind is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM feedback WHERE guild_id = ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (guild_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM feedback
+                    WHERE guild_id = ? AND kind = ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (guild_id, kind, limit),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_vote(self, feedback_id: int, user_id: int, vote: int):
+        """投票を付け外しし、最新の (賛成数, 反対数) を返す。
+
+        遷移は next_vote に従う: 未投票→その側に投票、同じ側→取り消し、
+        反対側→切り替え。
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT vote FROM feedback_votes
+                WHERE feedback_id = ? AND user_id = ?
+                """,
+                (feedback_id, user_id),
+            ).fetchone()
+            current = row["vote"] if row else None
+            new_vote = next_vote(current, vote)
+            if new_vote is None:
+                conn.execute(
+                    """
+                    DELETE FROM feedback_votes
+                    WHERE feedback_id = ? AND user_id = ?
+                    """,
+                    (feedback_id, user_id),
+                )
+            elif current is None:
+                conn.execute(
+                    """
+                    INSERT INTO feedback_votes (feedback_id, user_id, vote)
+                    VALUES (?, ?, ?)
+                    """,
+                    (feedback_id, user_id, new_vote),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE feedback_votes SET vote = ?
+                    WHERE feedback_id = ? AND user_id = ?
+                    """,
+                    (new_vote, feedback_id, user_id),
+                )
+            return self._count_votes(conn, feedback_id)
+
+    @staticmethod
+    def _count_votes(conn, feedback_id: int):
+        rows = conn.execute(
+            """
+            SELECT vote, COUNT(*) AS c FROM feedback_votes
+            WHERE feedback_id = ? GROUP BY vote
+            """,
+            (feedback_id,),
+        ).fetchall()
+        up = down = 0
+        for row in rows:
+            if row["vote"] > 0:
+                up = row["c"]
+            elif row["vote"] < 0:
+                down = row["c"]
+        return up, down
+
+    def count_votes(self, feedback_id: int):
+        """(賛成数, 反対数) を返す。"""
+        with self._conn() as conn:
+            return self._count_votes(conn, feedback_id)
+
+    # ---------- bump_reminders (DISBOARD の Bump リマインダー) ----------
+
+    def set_bump_reminder(
+        self, guild_id: int, channel_id: int, bumper_id, remind_at: float
+    ):
+        """ギルドの Bump リマインダーを予約する (既存があれば上書き)。
+
+        1ギルドにつき予約は1件だけ。新しく bump されたら予約し直す。
+        bumper_id は bump した人の ID (不明なら None)。
+        """
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO bump_reminders (
+                    guild_id, channel_id, bumper_id, remind_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    bumper_id = excluded.bumper_id,
+                    remind_at = excluded.remind_at
+                """,
+                (guild_id, channel_id, bumper_id, remind_at),
+            )
+
+    def get_bump_reminder(self, guild_id: int):
+        """ギルドの予約中リマインダーを dict で返す。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM bump_reminders WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_due_bump_reminders(self, now: float):
+        """通知時刻 (remind_at) を過ぎた予約をすべて返す (再起動後の回収用)。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM bump_reminders
+                WHERE remind_at <= ?
+                ORDER BY remind_at ASC, guild_id ASC
+                """,
+                (now,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_bump_reminder(self, guild_id: int):
+        """ギルドの予約中リマインダーを消す。"""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM bump_reminders WHERE guild_id = ?",
+                (guild_id,),
+            )
+
+    # ---------- バックアップ ----------
+
+    def backup_to(self, dest_path: str):
+        """DB の一貫したコピーを dest_path に書き出す。
+
+        sqlite3 の backup API を使うため、Bot が稼働中 (書き込みが
+        あり得る状態) でも途中の状態を掴まないコピーが得られる。
+        単なるファイルコピーは避けること。
+        """
+        directory = os.path.dirname(dest_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with closing(sqlite3.connect(self.path)) as source:
+            with closing(sqlite3.connect(dest_path)) as dest:
+                source.backup(dest)
+
+
+def next_vote(current, clicked):
+    """投票ボタンの遷移を決める純粋関数。
+
+    current は現在の投票 (+1/-1、未投票は None)、clicked は押した側 (+1/-1)。
+    戻り値は新しい投票 (+1/-1) か、取り消しなら None。
+    - 未投票で押す → その側に投票
+    - 同じ側をもう一度押す → 取り消し (None)
+    - 反対側を押す → 切り替え
+    """
+    if current is None:
+        return clicked
+    if current == clicked:
+        return None
+    return clicked
 
 
 # Cog から使うモジュールレベルのシングルトン
