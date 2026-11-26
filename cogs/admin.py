@@ -350,6 +350,16 @@ class AdminCog(commands.Cog):
             inline=False,
         )
 
+        embed.add_field(
+            name="ロールパネル",
+            value=(
+                f"{len(settings.get_role_panel_role_ids(gid))}件のロール"
+                " / 排他モード "
+                + ("ON" if settings.get_role_panel_exclusive(gid) else "OFF")
+            ),
+            inline=False,
+        )
+
         level_roles = settings.get_level_roles(gid)
         if level_roles:
             lines = []
