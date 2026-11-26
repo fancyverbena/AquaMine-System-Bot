@@ -11,6 +11,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.db import Database  # noqa: E402
 from app.ui import progress_bar, sanitize_channel_part  # noqa: E402
+from cogs.automod import (  # noqa: E402
+    content_violation,
+    find_invite,
+    find_ngword,
+    punishment_for_count,
+    spam_reason,
+)
 from cogs.leveling import (  # noqa: E402
     RECENT_CONTENT_HASH_LIMIT,
     calc_level,
@@ -305,6 +312,203 @@ class TestDatabaseMigration(unittest.TestCase):
             data = db.get_xp(7, 100)
             self.assertEqual(data["xp"], 520)
             self.assertEqual(data["recent_content_hashes"], ["abc", "def"])
+
+
+class TestAutomodPunishment(unittest.TestCase):
+    def test_ladder(self):
+        self.assertEqual(punishment_for_count(1), "warn")
+        self.assertEqual(punishment_for_count(2), "timeout")
+        self.assertEqual(punishment_for_count(3), "kick")
+        self.assertEqual(punishment_for_count(4), "ban")
+        self.assertEqual(punishment_for_count(10), "ban")
+
+
+class TestAutomodSpam(unittest.TestCase):
+    def test_flood(self):
+        now = 1000.0
+        # 10秒以内に5件 (内容はすべて別)
+        events = [(now - i, f"hash{i}") for i in range(5)]
+        self.assertEqual(spam_reason(events, now), "flood")
+
+    def test_repeat(self):
+        now = 1000.0
+        # 60秒以内に同一内容が3件 (連投の件数には届かない)
+        events = [(now - 50, "same"), (now - 30, "same"), (now, "same")]
+        self.assertEqual(spam_reason(events, now), "repeat")
+
+    def test_normal_traffic(self):
+        now = 1000.0
+        events = [(now - 100, "a"), (now - 50, "b"), (now, "c")]
+        self.assertIsNone(spam_reason(events, now))
+        self.assertIsNone(spam_reason([], now))
+
+    def test_window_expiry(self):
+        now = 1000.0
+        # 5件あっても全て10秒より前なら連投にならない
+        events = [(now - 20 - i, f"hash{i}") for i in range(5)]
+        self.assertIsNone(spam_reason(events, now))
+        # 同一内容3件でも全て60秒より前なら繰り返しにならない
+        events = [(now - 120, "x"), (now - 90, "x"), (now - 61, "x")]
+        self.assertIsNone(spam_reason(events, now))
+
+
+class TestAutomodNgWord(unittest.TestCase):
+    def test_match_with_normalization(self):
+        words = ["bad word", "バカ"]
+        # 大文字・余分な空白があっても正規化されて一致する
+        self.assertEqual(
+            find_ngword("this is a BAD   WORD here", words), "bad word"
+        )
+        self.assertEqual(find_ngword("おまえバカか", words), "バカ")
+
+    def test_no_match(self):
+        self.assertIsNone(find_ngword("普通のメッセージです", ["バカ"]))
+        self.assertIsNone(find_ngword("", ["バカ"]))
+        self.assertIsNone(find_ngword("何か言いたい", []))
+        self.assertIsNone(find_ngword("何か言いたい", None))
+
+
+class TestAutomodInvite(unittest.TestCase):
+    def test_matches_three_forms(self):
+        self.assertEqual(find_invite("join us discord.gg/abc123"), "discord.gg")
+        self.assertEqual(
+            find_invite("https://discord.com/invite/abc123"),
+            "discord.com/invite",
+        )
+        self.assertEqual(
+            find_invite("https://discordapp.com/invite/abc123"),
+            "discordapp.com/invite",
+        )
+        # 大文字でも一致する
+        self.assertEqual(find_invite("DISCORD.GG/XYZ"), "discord.gg")
+
+    def test_no_match(self):
+        self.assertIsNone(find_invite("https://example.com/invite/abc"))
+        # スラッシュなしの言及だけでは対象にしない
+        self.assertIsNone(find_invite("discord.gg というサイトがある"))
+        self.assertIsNone(find_invite("普通の文章です"))
+        self.assertIsNone(find_invite(""))
+
+
+class TestAutomodContentViolation(unittest.TestCase):
+    def test_mention_threshold(self):
+        self.assertIsNone(content_violation("こんにちは", [], 4, 5, True))
+        result = content_violation("こんにちは", [], 5, 5, True)
+        self.assertEqual(result[0], "mention")
+        # 上限 0 は検知無効
+        self.assertIsNone(content_violation("こんにちは", [], 99, 0, True))
+
+    def test_invite_toggle(self):
+        result = content_violation("discord.gg/abc", [], 0, 5, True)
+        self.assertEqual(result[0], "invite")
+        self.assertEqual(result[1], "discord.gg")
+        self.assertIsNone(content_violation("discord.gg/abc", [], 0, 5, False))
+
+    def test_ngword_priority(self):
+        result = content_violation("バカ discord.gg/abc", ["バカ"], 0, 5, True)
+        self.assertEqual(result, ("ngword", "バカ"))
+
+
+class TestInfractions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_add_count_recent_clear(self):
+        self.db.add_infraction(100, 7, "ngword", "バカ", "warn", 1000.0)
+        self.db.add_infraction(100, 7, "flood", "スパム（連投）", "timeout", 2000.0)
+        self.db.add_infraction(100, 8, "invite", "discord.gg", "warn", 2000.0)
+        self.db.add_infraction(200, 7, "ngword", "バカ", "warn", 2000.0)
+
+        # ギルド・ユーザー単位で数える
+        self.assertEqual(self.db.count_infractions(100, 7, 0.0), 2)
+        self.assertEqual(self.db.count_infractions(100, 8, 0.0), 1)
+        self.assertEqual(self.db.count_infractions(200, 7, 0.0), 1)
+        # since で期間を絞れる
+        self.assertEqual(self.db.count_infractions(100, 7, 1500.0), 1)
+        self.assertEqual(self.db.count_infractions(100, 7, 2000.0), 1)
+        self.assertEqual(self.db.count_infractions(100, 7, 2000.1), 0)
+
+        recent = self.db.recent_infractions(100, 7, 5)
+        self.assertEqual(len(recent), 2)
+        # 新しい順
+        self.assertEqual(recent[0]["reason"], "flood")
+        self.assertEqual(recent[0]["punishment"], "timeout")
+        self.assertEqual(recent[1]["reason"], "ngword")
+        self.assertEqual(recent[1]["detail"], "バカ")
+        # limit が効く
+        self.assertEqual(len(self.db.recent_infractions(100, 7, 1)), 1)
+
+        removed = self.db.clear_infractions(100, 7)
+        self.assertEqual(removed, 2)
+        self.assertEqual(self.db.count_infractions(100, 7, 0.0), 0)
+        # 他のユーザー・ギルドには影響しない
+        self.assertEqual(self.db.count_infractions(100, 8, 0.0), 1)
+        self.assertEqual(self.db.count_infractions(200, 7, 0.0), 1)
+
+    def test_pre_automod_schema_db_opens(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.db")
+            conn = sqlite3.connect(path)
+            with conn:
+                # automod 導入前のスキーマ (infractions テーブルなし)
+                conn.executescript(
+                    """
+                    CREATE TABLE guild_settings (
+                        guild_id INTEGER NOT NULL,
+                        key TEXT NOT NULL,
+                        value TEXT,
+                        PRIMARY KEY (guild_id, key)
+                    );
+                    CREATE TABLE user_xp (
+                        user_id INTEGER NOT NULL,
+                        guild_id INTEGER NOT NULL,
+                        xp INTEGER NOT NULL DEFAULT 0,
+                        level INTEGER NOT NULL DEFAULT 0,
+                        last_message_time REAL NOT NULL DEFAULT 0,
+                        recent_content_hashes TEXT,
+                        PRIMARY KEY (user_id, guild_id)
+                    );
+                    CREATE TABLE tickets (
+                        channel_id INTEGER PRIMARY KEY,
+                        guild_id INTEGER NOT NULL,
+                        owner_id INTEGER NOT NULL,
+                        assignee_id INTEGER,
+                        ticket_type TEXT NOT NULL,
+                        subject TEXT,
+                        message_id INTEGER,
+                        created_at REAL NOT NULL,
+                        last_activity_at REAL NOT NULL
+                    );
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO guild_settings VALUES (100, 'k', '123')"
+                )
+            conn.close()
+
+            db = Database(path)
+
+            conn = sqlite3.connect(path)
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            conn.close()
+            self.assertIn("infractions", tables)
+
+            # 既存データが保持され、新テーブルも使える
+            self.assertEqual(db.get_setting(100, "k"), 123)
+            self.assertEqual(db.count_infractions(100, 7, 0.0), 0)
+            db.add_infraction(100, 7, "ngword", "バカ", "warn", 1000.0)
+            self.assertEqual(db.count_infractions(100, 7, 0.0), 1)
 
 
 class TestRulesText(unittest.TestCase):

@@ -2,7 +2,7 @@
 
 構成:
   app/   共通基盤 (設定, DB, UI, 権限チェック)
-  cogs/  機能ごと (admin, verify, tickets, leveling, help)
+  cogs/  機能ごと (admin, verify, tickets, leveling, automod, help)
 データはすべて data/bot.db (SQLite) に保存される。
 """
 import discord
@@ -27,6 +27,7 @@ class Bot(commands.Bot):
             "cogs.verify",
             "cogs.tickets",
             "cogs.leveling",
+            "cogs.automod",
             "cogs.help",
         ):
             await self.load_extension(extension)
@@ -45,6 +46,9 @@ class Bot(commands.Bot):
 intents = discord.Intents.default()
 intents.guilds = True
 intents.members = True
+# 発言内容の判定 (自動モデレーション / レベリングの重複判定) に必須。
+# Developer Portal で MESSAGE CONTENT INTENT を有効化していないとログインできない。
+intents.message_content = True
 
 bot = Bot(command_prefix="!", intents=intents)
 

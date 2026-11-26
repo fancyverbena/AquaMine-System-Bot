@@ -337,6 +337,19 @@ class AdminCog(commands.Cog):
             inline=False,
         )
 
+        automod_log_id = settings.get_automod_log_channel_id(gid)
+        automod_log = guild.get_channel(automod_log_id) if automod_log_id else None
+        embed.add_field(
+            name="自動モデレーション",
+            value=(
+                ("ON" if settings.get_automod_enabled(gid) else "OFF")
+                + f" / NGワード {len(settings.get_automod_ngwords(gid))}件"
+                + " / ログ "
+                + (automod_log.mention if automod_log else "未設定")
+            ),
+            inline=False,
+        )
+
         level_roles = settings.get_level_roles(gid)
         if level_roles:
             lines = []

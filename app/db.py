@@ -5,6 +5,7 @@
   user_xp(user_id, guild_id, xp, level, last_message_time, recent_content_hashes)
   tickets(channel_id, guild_id, owner_id, assignee_id, ticket_type,
           subject, message_id, created_at, last_activity_at)
+  infractions(id, guild_id, user_id, reason, detail, punishment, created_at)
 
 すべてのアクセスは context manager 経由で行い、接続を漏らさない。
 """
@@ -53,6 +54,15 @@ class Database:
                         last_message_time REAL NOT NULL DEFAULT 0,
                         recent_content_hashes TEXT,
                         PRIMARY KEY (user_id, guild_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS infractions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        reason TEXT NOT NULL,
+                        detail TEXT,
+                        punishment TEXT NOT NULL,
+                        created_at REAL NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS tickets (
                         channel_id INTEGER PRIMARY KEY,
@@ -333,6 +343,66 @@ class Database:
                 "DELETE FROM tickets WHERE channel_id = ?",
                 (channel_id,),
             )
+
+    # ---------- infractions (自動モデレーションの違反履歴) ----------
+
+    def add_infraction(
+        self,
+        guild_id: int,
+        user_id: int,
+        reason: str,
+        detail,
+        punishment: str,
+        created_at: float,
+    ) -> int:
+        """違反を1件記録し、新しい行の id を返す。"""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO infractions (
+                    guild_id, user_id, reason, detail, punishment, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (guild_id, user_id, reason, detail, punishment, created_at),
+            )
+            return cursor.lastrowid
+
+    def count_infractions(self, guild_id: int, user_id: int, since: float) -> int:
+        """since (UNIX 時刻) 以降の違反件数。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM infractions
+                WHERE guild_id = ? AND user_id = ? AND created_at >= ?
+                """,
+                (guild_id, user_id, since),
+            ).fetchone()
+        return row["c"] if row else 0
+
+    def recent_infractions(self, guild_id: int, user_id: int, limit: int = 5):
+        """新しい順に最大 limit 件の違反履歴を dict のリストで返す。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, guild_id, user_id, reason, detail, punishment,
+                       created_at
+                FROM infractions
+                WHERE guild_id = ? AND user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (guild_id, user_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_infractions(self, guild_id: int, user_id: int) -> int:
+        """そのメンバーの違反履歴をすべて消し、削除件数を返す。"""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                "DELETE FROM infractions WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            return cursor.rowcount
 
 
 # Cog から使うモジュールレベルのシングルトン
