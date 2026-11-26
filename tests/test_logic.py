@@ -317,10 +317,11 @@ class TestDatabaseMigration(unittest.TestCase):
 class TestAutomodPunishment(unittest.TestCase):
     def test_ladder(self):
         self.assertEqual(punishment_for_count(1), "warn")
-        self.assertEqual(punishment_for_count(2), "timeout")
-        self.assertEqual(punishment_for_count(3), "kick")
-        self.assertEqual(punishment_for_count(4), "ban")
-        self.assertEqual(punishment_for_count(10), "ban")
+        self.assertEqual(punishment_for_count(10), "warn")
+        self.assertEqual(punishment_for_count(11), "timeout")
+        self.assertEqual(punishment_for_count(12), "kick")
+        self.assertEqual(punishment_for_count(13), "ban")
+        self.assertEqual(punishment_for_count(30), "ban")
 
 
 class TestAutomodSpam(unittest.TestCase):

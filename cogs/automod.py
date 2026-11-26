@@ -7,8 +7,8 @@
   - Discord 招待リンク (設定で無効化可能)
 
 違反すると発言を削除して違反履歴 (DB) に記録し、直近30日の違反回数に
-応じて段階的に処罰する: 1回目=警告、2回目=タイムアウト10分、3回目=キック、
-4回目以降=BAN。管理者・manage_messages 権限持ち・サーバーオーナーと
+応じて段階的に処罰する: 10回目まで=警告のみ、11回目=タイムアウト10分、
+12回目=キック、13回目以降=BAN。管理者・manage_messages 権限持ち・サーバーオーナーと
 対象外チャンネルは処罰しない。
 
 既定では無効。設定を済ませてから /automod toggle で有効化する。
@@ -72,12 +72,15 @@ INVITE_REGEX = re.compile(
 
 
 def punishment_for_count(count: int) -> str:
-    """直近30日の違反回数 (今回を含む) に対する処罰キー。"""
-    if count <= 1:
+    """直近30日の違反回数 (今回を含む) に対する処罰キー。
+
+    10回目までは警告のみで許容し、11回目から処罰が重くなる。
+    """
+    if count <= 10:
         return "warn"
-    if count == 2:
+    if count == 11:
         return "timeout"
-    if count == 3:
+    if count == 12:
         return "kick"
     return "ban"
 
