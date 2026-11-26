@@ -8,7 +8,9 @@ XP を付与しない (判定は xp_block_reason に集約)。
 (条件は vc_eligible、レートはギルド設定 vc_xp_per_minute、0 で無効)。
 レベル L に必要な累計 XP は 0 (L=0) または 5*L^2 + 50*L + 100。
 """
+import asyncio
 import hashlib
+import io
 import random
 import time
 
@@ -472,7 +474,9 @@ class LevelingCog(commands.Cog):
     # ---------- /rank ----------
 
     @app_commands.command(name="rank", description="自分のレベルとランクを表示します")
-    async def rank(self, interaction: discord.Interaction):
+    @app_commands.describe(image="カード画像で表示するか（省略時は埋め込み表示）")
+    @app_commands.rename(image="画像")
+    async def rank(self, interaction: discord.Interaction, image: bool = False):
         guild = interaction.guild
         user = interaction.user
         if guild is None:
@@ -499,7 +503,66 @@ class LevelingCog(commands.Cog):
         embed.set_footer(
             text=f"スパム防止のため、XPは{cooldown}秒に1回だけ加算されます。"
         )
+        if image:
+            await self._send_rank_card(
+                interaction, user, embed,
+                level=level, fraction=fraction, remaining=remaining,
+                xp=xp, rank=rank,
+            )
+            return
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _send_rank_card(
+        self, interaction: discord.Interaction, user, embed: discord.Embed,
+        *, level: int, fraction: float, remaining: int, xp: int, rank: int,
+    ):
+        """ランクカード画像を送信する。
+
+        生成や送信に失敗した場合はログを残し、埋め込み表示に
+        フォールバックする (このメソッド自体は例外を投げない)。
+        """
+        try:
+            # Pillow が無い環境でも埋め込み表示が壊れないよう遅延 import
+            from app.rankcard import generate_rank_card
+
+            await interaction.response.defer(ephemeral=True)
+            avatar_bytes = None
+            try:
+                avatar_bytes = await asyncio.wait_for(
+                    user.display_avatar.read(), timeout=5
+                )
+            except Exception:
+                avatar_bytes = None  # 取得失敗時はプレースホルダーで描く
+            png = await asyncio.to_thread(
+                generate_rank_card,
+                display_name=user.display_name,
+                level=level,
+                rank_position=rank,
+                total_xp=xp,
+                fraction=fraction,
+                remaining_xp=remaining,
+                next_level=level + 1,
+                next_threshold=xp_threshold(level + 1),
+                avatar_bytes=avatar_bytes,
+            )
+            await interaction.followup.send(
+                file=discord.File(io.BytesIO(png), filename="rank-card.png"),
+                ephemeral=True,
+            )
+        except Exception as error:
+            print(
+                f"⚠️ ランクカード生成に失敗、埋め込みで代替: "
+                f"{type(error).__name__}: {error}"
+            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(embed=embed, ephemeral=True)
+                else:
+                    await interaction.response.send_message(
+                        embed=embed, ephemeral=True
+                    )
+            except discord.HTTPException:
+                pass
 
     # ---------- /leaderboard ----------
 
