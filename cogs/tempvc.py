@@ -19,6 +19,13 @@ VC を自動で作成して移動させる。Bot を除くメンバーが全員�
   sanitize_channel_part (チケットのチャンネル名で使われているもの) を
   流用し、小文字化・記号のハイフン化・長さ制限を通してから接尾辞を
   付ける。全体は Discord の上限 (100文字) 以内に収める。
+
+公開範囲について:
+  作成した VC はサーバーの全員が見て・入れるのが前提のため、カテゴリの
+  権限を引き継がず、@everyone (default_role) に「チャンネルを見る」と
+  「接続」を明示的に許可する上書きを付けて作る (public_overwrites)。
+  ロビーが非公開カテゴリにあっても、一時 VC だけは全員に見える。
+  これは権限の許可のみで、@everyone メンション等の通知は行わない。
 """
 import asyncio
 import time
@@ -76,6 +83,22 @@ def join_action(existing_row) -> str:
     なければ 'create'。
     """
     return "reuse" if existing_row else "create"
+
+
+def public_overwrites(default_role) -> dict:
+    """一時 VC を全員が見られる・入れるようにする権限上書きを返す。
+
+    カテゴリの権限を引き継ぐと、ロビーが非公開カテゴリにある場合に
+    一時 VC も見えなくなってしまうため、@everyone (default_role) に
+    「チャンネルを見る」「接続」を明示的に許可する。許可するのは
+    この2つだけで、メンション等の通知は一切行わない。
+    """
+    return {
+        default_role: discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+        )
+    }
 
 
 class TempVcCog(commands.Cog):
@@ -206,6 +229,7 @@ class TempVcCog(commands.Cog):
                 channel = await guild.create_voice_channel(
                     name=temp_channel_name(member.display_name),
                     category=lobby_channel.category,
+                    overwrites=public_overwrites(guild.default_role),
                     reason=f"一時VC: {member} 用に自動作成",
                 )
             except (discord.Forbidden, discord.HTTPException) as error:
