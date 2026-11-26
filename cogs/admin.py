@@ -193,13 +193,15 @@ class SetupView(discord.ui.View):
             return
         from .verify import build_rules_panel
 
-        embed, view = build_rules_panel()
+        chunks, view = build_rules_panel()
         channel = interaction.guild.get_channel(self.channel_id)
         if not isinstance(channel, discord.TextChannel):
             await reply_error(interaction, "設置先のチャンネルが見つかりません。")
             return
         try:
-            await channel.send(embed=embed, view=view)
+            for chunk in chunks[:-1]:
+                await channel.send(chunk)
+            await channel.send(chunks[-1], view=view)
         except discord.HTTPException as e:
             await reply_error(interaction, f"パネルの設置に失敗しました。\n`{e}`")
             return
