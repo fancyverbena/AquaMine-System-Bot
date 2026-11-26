@@ -4,6 +4,8 @@ XP は発言ごとに付与される。入手量・クールダウン・最小�
 (/level config で変更可能、DB の guild_settings に保存)。
 スパム対策として、テキストなし・短すぎる発言・直前と同一内容の連投には
 XP を付与しない (判定は xp_block_reason に集約)。
+また、ボイスチャンネル (VC) 滞在でも 1分ごとに XP が付与される
+(条件は vc_eligible、レートはギルド設定 vc_xp_per_minute、0 で無効)。
 レベル L に必要な累計 XP は 0 (L=0) または 5*L^2 + 50*L + 100。
 """
 import hashlib
@@ -12,7 +14,7 @@ import time
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from app import settings
 from app.db import db
@@ -101,9 +103,16 @@ def next_recent_hashes(recent_hashes, new_hash: str) -> list:
 
 
 def validate_xp_config(
-    xp_min: int, xp_max: int, cooldown_seconds: int, min_length: int
+    xp_min: int,
+    xp_max: int,
+    cooldown_seconds: int,
+    min_length: int,
+    vc_xp_per_minute: int = None,
 ):
-    """XP 設定の検証。問題があれば日本語のエラーメッセージを返す。"""
+    """XP 設定の検証。問題があれば日本語のエラーメッセージを返す。
+
+    vc_xp_per_minute が None の場合は VC XP の検証をスキップする。
+    """
     if not (0 <= xp_min <= xp_max <= settings.XP_HARD_MAX):
         return (
             f"XP入手量は 0 〜 {settings.XP_HARD_MAX} の範囲で、"
@@ -113,7 +122,72 @@ def validate_xp_config(
         return f"クールダウンは 0 〜 {settings.COOLDOWN_HARD_MAX} 秒で指定してください。"
     if not (0 <= min_length <= settings.MIN_LENGTH_HARD_MAX):
         return f"最小文字数は 0 〜 {settings.MIN_LENGTH_HARD_MAX} で指定してください。"
+    if vc_xp_per_minute is not None and not (
+        0 <= vc_xp_per_minute <= settings.VC_XP_HARD_MAX
+    ):
+        return (
+            f"VC XP は 0 〜 {settings.VC_XP_HARD_MAX} の範囲で"
+            "指定してください (0 で無効)。"
+        )
     return None
+
+
+# VC 滞在 XP の付与間隔 (秒)。この間隔ごとに、連続して対象状態だった
+# メンバーへ1分分 (vc_xp_per_minute) を付与する。
+VC_TICK_SECONDS = 60
+
+
+def vc_eligible(
+    is_bot: bool,
+    is_afk_channel: bool,
+    self_deaf: bool,
+    deaf: bool,
+    human_count: int,
+) -> bool:
+    """VC 滞在で XP 対象になる条件を判定する純粋関数。
+
+    条件: Bot でない / AFK チャンネルでない / スピーカーミュート
+    (self_deaf・サーバー側 deaf のどちらも) でない / 同じチャンネルに
+    Bot でないメンバーが2人以上いる。マイクミュート (self_mute) は不問。
+    """
+    if is_bot:
+        return False
+    if is_afk_channel:
+        return False
+    if self_deaf or deaf:
+        return False
+    if human_count < 2:
+        return False
+    return True
+
+
+def advance_vc_sessions(
+    sessions: dict,
+    now: float,
+    eligible_keys,
+    tick_seconds: int = VC_TICK_SECONDS,
+):
+    """VC セッションを1ティック進める純粋関数。
+
+    sessions は {(guild_id, user_id): 連続して対象状態だった開始時刻}、
+    eligible_keys は現在も対象状態にあるキーの集合。
+    戻り値は (付与対象キーのリスト, 更新後の sessions)。
+    - 対象でなくなったキーは破棄する (部分的な経過時間は切り捨て、付与なし)
+    - tick_seconds 以上経過したキーは付与対象となり、開始時刻が now に
+      リセットされる (1ティックの付与は1分分まで。端数は持ち越さない)
+    - それ以外のキーは開始時刻のまま保持する
+    """
+    grants = []
+    updated = {}
+    for key, start in sessions.items():
+        if key not in eligible_keys:
+            continue
+        if now - start >= tick_seconds:
+            grants.append(key)
+            updated[key] = now
+        else:
+            updated[key] = start
+    return grants, updated
 
 
 class LeaderboardView(discord.ui.View):
@@ -163,8 +237,54 @@ class LeaderboardView(discord.ui.View):
 class LevelingCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        # VC セッション: {(guild_id, user_id): 連続して対象状態だった開始時刻}
+        self._vc_sessions: dict = {}
+        self.vc_xp_loop.start()
 
-    # ---------- XP 付与 ----------
+    def cog_unload(self):
+        self.vc_xp_loop.cancel()
+
+    # ---------- XP 付与 (共通) ----------
+
+    async def grant_xp(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        amount: int,
+        *,
+        last_message_time: float = None,
+        recent_content_hashes=None,
+        announce_channel: discord.TextChannel = None,
+    ):
+        """XP を amount だけ加算する共通処理 (発言・VC の両経路で使う)。
+
+        last_message_time / recent_content_hashes を省略すると DB の現在値を
+        そのまま引き継ぐ (VC 付与で発言側のクールダウンや重複履歴を壊さない)。
+        レベルアップしたらレベルロールを付与し、announce_channel
+        (未指定ならレベル通知チャンネル) へ通知する。
+        """
+        data = db.get_xp(member.id, guild.id, create=True)
+        new_xp = data["xp"] + amount
+        old_level = data["level"]
+        new_level = calc_level(new_xp)
+        db.upsert_xp(
+            member.id,
+            guild.id,
+            new_xp,
+            new_level,
+            data["last_message_time"]
+            if last_message_time is None
+            else last_message_time,
+            recent_content_hashes=(
+                data["recent_content_hashes"]
+                if recent_content_hashes is None
+                else recent_content_hashes
+            ),
+        )
+        if new_level > old_level:
+            await self._on_level_up(guild, member, new_level, announce_channel)
+
+    # ---------- XP 付与 (発言) ----------
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -190,28 +310,25 @@ class LevelingCog(commands.Cog):
             # (クールダウンが延びたり、重複ブロックが自己継続したりしない)
             return
 
-        new_xp = data["xp"] + random.randint(config["xp_min"], config["xp_max"])
-        old_level = data["level"]
-        new_level = calc_level(new_xp)
-        db.upsert_xp(
-            user.id,
-            guild.id,
-            new_xp,
-            new_level,
-            now,
+        await self.grant_xp(
+            guild,
+            user,
+            random.randint(config["xp_min"], config["xp_max"]),
+            last_message_time=now,
             recent_content_hashes=next_recent_hashes(
                 data["recent_content_hashes"],
                 content_hash(message.content),
             ),
+            announce_channel=message.channel,
         )
 
-        if new_level > old_level:
-            await self._on_level_up(message, user, new_level)
-
     async def _on_level_up(
-        self, message: discord.Message, member: discord.Member, new_level: int
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        new_level: int,
+        fallback_channel: discord.TextChannel = None,
     ):
-        guild = message.guild
         level_roles = settings.get_level_roles(guild.id)
         for level_str, role_id_str in level_roles.items():
             try:
@@ -238,16 +355,119 @@ class LevelingCog(commands.Cog):
             description=f"{member.mention} が **レベル {new_level}** に上がりました！",
             color=COLOR_GOLD,
         )
-        target = message.channel
+        target = fallback_channel
         levelup_id = settings.get(guild.id, settings.LEVELUP_CHANNEL_ID)
         if levelup_id:
             channel = guild.get_channel(int(levelup_id))
             if isinstance(channel, discord.TextChannel):
                 target = channel
+        if target is None:
+            # 通知先がない (VC 付与でレベル通知チャンネル未設定) 場合は
+            # ロール付与だけ行って通知はしない
+            return
         try:
             await target.send(embed=embed)
         except discord.HTTPException:
             pass
+
+    # ---------- XP 付与 (VC 滞在) ----------
+
+    def _member_vc_eligible(self, member: discord.Member) -> bool:
+        """メンバーの現在のボイス状態が VC XP の対象かどうか。"""
+        state = member.voice
+        if state is None or state.channel is None:
+            return False
+        channel = state.channel
+        human_count = sum(1 for m in channel.members if not m.bot)
+        return vc_eligible(
+            is_bot=member.bot,
+            is_afk_channel=channel is member.guild.afk_channel,
+            self_deaf=state.self_deaf,
+            deaf=state.deaf,
+            human_count=human_count,
+        )
+
+    def _refresh_vc_session(self, member: discord.Member, now: float):
+        """メンバーの VC セッションを現在の状態に合わせて更新する。
+
+        対象状態が続いている場合は開始時刻を維持し、対象でなくなったら
+        セッションを破棄する (1分未満の経過時間は切り捨て)。
+        """
+        key = (member.guild.id, member.id)
+        if (
+            settings.get_vc_xp_per_minute(member.guild.id) > 0
+            and self._member_vc_eligible(member)
+        ):
+            self._vc_sessions.setdefault(key, now)
+        else:
+            self._vc_sessions.pop(key, None)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ):
+        if member.bot:
+            return
+        # 参加・退出・移動で同室メンバーの人数条件も変わるため、
+        # 移動前後のチャンネルの全員について状態を再評価する
+        affected = {member}
+        for state in (before, after):
+            if state.channel is not None:
+                affected.update(state.channel.members)
+        now = time.time()
+        for target in affected:
+            if not target.bot:
+                self._refresh_vc_session(target, now)
+
+    def _seed_vc_sessions(self):
+        """起動時点で既に VC にいるメンバーからセッションを初期化する。
+
+        Bot 再起動をまたいだ滞在時間は数えず、起動後から新たに計測する
+        (最初の付与は60秒間対象状態が続いた後)。
+        """
+        now = time.time()
+        for guild in self.bot.guilds:
+            if settings.get_vc_xp_per_minute(guild.id) <= 0:
+                continue
+            channels = (*guild.voice_channels, *guild.stage_channels)
+            for channel in channels:
+                for member in channel.members:
+                    if self._member_vc_eligible(member):
+                        self._vc_sessions.setdefault((guild.id, member.id), now)
+
+    @tasks.loop(seconds=VC_TICK_SECONDS)
+    async def vc_xp_loop(self):
+        if not self._vc_sessions:
+            return
+        now = time.time()
+        eligible = {}
+        for guild_id, user_id in list(self._vc_sessions):
+            guild = self.bot.get_guild(guild_id)
+            member = guild.get_member(user_id) if guild is not None else None
+            rate = settings.get_vc_xp_per_minute(guild_id)
+            if (
+                member is not None
+                and rate > 0
+                and self._member_vc_eligible(member)
+            ):
+                eligible[(guild_id, user_id)] = (guild, member, rate)
+        grants, self._vc_sessions = advance_vc_sessions(
+            self._vc_sessions, now, set(eligible)
+        )
+        for guild_id, user_id in grants:
+            guild, member, rate = eligible[(guild_id, user_id)]
+            try:
+                await self.grant_xp(guild, member, rate)
+            except Exception as error:  # 1人の失敗でループ自体を止めない
+                print(f"⚠️ VC XP 付与に失敗 ({user_id}@{guild_id}): {error}")
+
+    @vc_xp_loop.before_loop
+    async def before_vc_xp_loop(self):
+        await self.bot.wait_until_ready()
+        self._seed_vc_sessions()
 
     # ---------- /rank ----------
 
@@ -407,7 +627,7 @@ class LevelingCog(commands.Cog):
 
     @level_group.command(
         name="config",
-        description="XP入手量・クールダウン・最小文字数を変更します（指定した項目だけ更新）",
+        description="XP入手量・クールダウン・最小文字数・VC XPを変更します（指定した項目だけ更新）",
     )
     @app_commands.checks.has_permissions(administrator=True)
     @app_commands.describe(
@@ -415,6 +635,7 @@ class LevelingCog(commands.Cog):
         xp_max="1回の発言で得るXPの最大値（0〜10000）",
         cooldown_seconds="XPが貯まる間隔（秒、0〜3600）",
         min_length="XP対象になる最小の文字数（0〜200）",
+        vc_xp_per_minute="VC滞在で1分ごとに得るXP（0〜1000、0で無効）",
     )
     async def level_config(
         self,
@@ -423,6 +644,7 @@ class LevelingCog(commands.Cog):
         xp_max: int = None,
         cooldown_seconds: int = None,
         min_length: int = None,
+        vc_xp_per_minute: int = None,
     ):
         if not self._guard_admin_guild(interaction):
             await self._reject(interaction)
@@ -440,9 +662,14 @@ class LevelingCog(commands.Cog):
         new_min_length = (
             min_length if min_length is not None else config["xp_min_length"]
         )
+        new_vc_xp = (
+            vc_xp_per_minute
+            if vc_xp_per_minute is not None
+            else settings.get_vc_xp_per_minute(guild.id)
+        )
 
         error = validate_xp_config(
-            new_min, new_max, new_cooldown, new_min_length
+            new_min, new_max, new_cooldown, new_min_length, new_vc_xp
         )
         if error is not None:
             await reply_error(interaction, error)
@@ -458,13 +685,22 @@ class LevelingCog(commands.Cog):
             )
         if min_length is not None:
             settings.set_value(guild.id, settings.XP_MIN_LENGTH, min_length)
+        if vc_xp_per_minute is not None:
+            settings.set_value(
+                guild.id, settings.VC_XP_PER_MINUTE, vc_xp_per_minute
+            )
 
         effective = settings.get_xp_config(guild.id)
+        effective_vc_xp = settings.get_vc_xp_per_minute(guild.id)
+        vc_text = (
+            f"{effective_vc_xp} XP/分" if effective_vc_xp > 0 else "無効"
+        )
         await interaction.response.send_message(
             "✅ レベリング設定を更新しました。\n"
             f"・XP入手量: {effective['xp_min']} 〜 {effective['xp_max']}\n"
             f"・クールダウン: {effective['xp_cooldown_seconds']} 秒\n"
-            f"・最小文字数: {effective['xp_min_length']} 文字",
+            f"・最小文字数: {effective['xp_min_length']} 文字\n"
+            f"・VC XP: {vc_text}",
             ephemeral=True,
         )
 

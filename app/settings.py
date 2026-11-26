@@ -15,6 +15,7 @@ XP_MIN = "xp_min"
 XP_MAX = "xp_max"
 XP_COOLDOWN_SECONDS = "xp_cooldown_seconds"
 XP_MIN_LENGTH = "xp_min_length"
+VC_XP_PER_MINUTE = "vc_xp_per_minute"
 AUTOMOD_ENABLED = "automod_enabled"
 AUTOMOD_NGWORDS = "automod_ngwords"
 AUTOMOD_LOG_CHANNEL_ID = "automod_log_channel_id"
@@ -36,6 +37,8 @@ DEFAULT_XP_MIN_LENGTH = 3
 XP_HARD_MAX = 10000
 COOLDOWN_HARD_MAX = 3600
 MIN_LENGTH_HARD_MAX = 200
+DEFAULT_VC_XP_PER_MINUTE = 2
+VC_XP_HARD_MAX = 1000
 
 # 自動モデレーション設定のデフォルトと許容範囲
 DEFAULT_AUTOMOD_MENTION_LIMIT = 5
@@ -115,6 +118,14 @@ def get_xp_config(guild_id: int) -> dict:
         "xp_cooldown_seconds": cooldown,
         "xp_min_length": min_length,
     }
+
+
+def get_vc_xp_per_minute(guild_id: int) -> int:
+    """VC 滞在で1分ごとに得る XP (0 で VC XP 無効、範囲外はデフォルト)。"""
+    value = _get_int(guild_id, VC_XP_PER_MINUTE, DEFAULT_VC_XP_PER_MINUTE)
+    if not (0 <= value <= VC_XP_HARD_MAX):
+        return DEFAULT_VC_XP_PER_MINUTE
+    return value
 
 
 def get_automod_enabled(guild_id: int) -> bool:
