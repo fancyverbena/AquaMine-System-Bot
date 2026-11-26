@@ -2,7 +2,8 @@
 
 構成:
   app/   共通基盤 (設定, DB, UI, 権限チェック)
-  cogs/  機能ごと (admin, verify, tickets, leveling, automod, help)
+  cogs/  機能ごと (admin, verify, tickets, leveling, automod, roles,
+         giveaway, feedback, bump, backup, serverlog, help)
 データはすべて data/bot.db (SQLite) に保存される。
 """
 import discord
@@ -14,13 +15,27 @@ from app import config
 
 class Bot(commands.Bot):
     async def setup_hook(self):
-        from cogs.tickets import TicketControlsView, TicketPanelView
+        from cogs.feedback import FeedbackStatusButton, FeedbackVoteButton
+        from cogs.giveaway import GiveawayButton
+        from cogs.roles import RoleButton
+        from cogs.tickets import (
+            TicketControlsView,
+            TicketPanelView,
+            TicketRatingButton,
+        )
         from cogs.verify import AgreeView
 
         # 永続 View (再起動後も既存パネルのボタン/セレクトが効くように)
         self.add_view(AgreeView())
         self.add_view(TicketPanelView())
         self.add_view(TicketControlsView())
+        # ロールパネル・抽選・フィードバックのボタンは
+        # custom_id に ID を埋め込む動的アイテム
+        self.add_dynamic_items(RoleButton)
+        self.add_dynamic_items(GiveawayButton)
+        self.add_dynamic_items(FeedbackVoteButton)
+        self.add_dynamic_items(FeedbackStatusButton)
+        self.add_dynamic_items(TicketRatingButton)
 
         for extension in (
             "cogs.admin",
@@ -28,6 +43,12 @@ class Bot(commands.Bot):
             "cogs.tickets",
             "cogs.leveling",
             "cogs.automod",
+            "cogs.roles",
+            "cogs.giveaway",
+            "cogs.feedback",
+            "cogs.bump",
+            "cogs.backup",
+            "cogs.serverlog",
             "cogs.help",
         ):
             await self.load_extension(extension)
