@@ -2,7 +2,7 @@
 
 テーブル:
   guild_settings(guild_id, key, value)  -- value は JSON 文字列
-  user_xp(user_id, guild_id, xp, level, last_message_time)
+  user_xp(user_id, guild_id, xp, level, last_message_time, recent_content_hashes)
   tickets(channel_id, guild_id, owner_id, assignee_id, ticket_type,
           subject, message_id, created_at, last_activity_at)
 
@@ -51,6 +51,7 @@ class Database:
                         xp INTEGER NOT NULL DEFAULT 0,
                         level INTEGER NOT NULL DEFAULT 0,
                         last_message_time REAL NOT NULL DEFAULT 0,
+                        recent_content_hashes TEXT,
                         PRIMARY KEY (user_id, guild_id)
                     );
                     CREATE TABLE IF NOT EXISTS tickets (
@@ -66,6 +67,19 @@ class Database:
                     );
                     """
                 )
+                self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn):
+        """既存 DB への列追加などのマイグレーション (既存行は保持する)。"""
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(user_xp)").fetchall()
+        }
+        if columns and "recent_content_hashes" not in columns:
+            conn.execute(
+                "ALTER TABLE user_xp ADD COLUMN recent_content_hashes TEXT"
+            )
 
     # ---------- guild_settings ----------
 
@@ -95,12 +109,26 @@ class Database:
 
     # ---------- user_xp ----------
 
+    @staticmethod
+    def _parse_hashes(raw) -> list:
+        """recent_content_hashes (JSON 配列文字列) をリストに戻す。"""
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+        if not isinstance(value, list):
+            return []
+        return [str(h) for h in value]
+
     def get_xp(self, user_id: int, guild_id: int, create: bool = False) -> dict:
         """ユーザーの XP 行を返す。create=False の読み取りでは行を作らない。"""
         with self._conn() as conn:
             row = conn.execute(
                 """
-                SELECT xp, level, last_message_time FROM user_xp
+                SELECT xp, level, last_message_time, recent_content_hashes
+                FROM user_xp
                 WHERE user_id = ? AND guild_id = ?
                 """,
                 (user_id, guild_id),
@@ -113,13 +141,26 @@ class Database:
                     """,
                     (user_id, guild_id),
                 )
-                return {"xp": 0, "level": 0, "last_message_time": 0}
+                return {
+                    "xp": 0,
+                    "level": 0,
+                    "last_message_time": 0,
+                    "recent_content_hashes": [],
+                }
         if row is None:
-            return {"xp": 0, "level": 0, "last_message_time": 0}
+            return {
+                "xp": 0,
+                "level": 0,
+                "last_message_time": 0,
+                "recent_content_hashes": [],
+            }
         return {
             "xp": row["xp"],
             "level": row["level"],
             "last_message_time": row["last_message_time"],
+            "recent_content_hashes": self._parse_hashes(
+                row["recent_content_hashes"]
+            ),
         }
 
     def upsert_xp(
@@ -129,18 +170,35 @@ class Database:
         xp: int,
         level: int,
         last_message_time: float,
+        recent_content_hashes=None,
     ):
+        hashes_json = (
+            json.dumps(list(recent_content_hashes))
+            if recent_content_hashes is not None
+            else None
+        )
         with self._conn() as conn:
             conn.execute(
                 """
-                INSERT INTO user_xp (user_id, guild_id, xp, level, last_message_time)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO user_xp (
+                    user_id, guild_id, xp, level, last_message_time,
+                    recent_content_hashes
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(user_id, guild_id) DO UPDATE SET
                     xp = excluded.xp,
                     level = excluded.level,
-                    last_message_time = excluded.last_message_time
+                    last_message_time = excluded.last_message_time,
+                    recent_content_hashes = excluded.recent_content_hashes
                 """,
-                (user_id, guild_id, xp, level, last_message_time),
+                (
+                    user_id,
+                    guild_id,
+                    xp,
+                    level,
+                    last_message_time,
+                    hashes_json,
+                ),
             )
 
     def delete_xp(self, user_id: int, guild_id: int):

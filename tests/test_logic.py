@@ -11,7 +11,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app.db import Database  # noqa: E402
 from app.ui import progress_bar, sanitize_channel_part  # noqa: E402
-from cogs.leveling import calc_level, level_progress, xp_threshold  # noqa: E402
+from cogs.leveling import (  # noqa: E402
+    RECENT_CONTENT_HASH_LIMIT,
+    calc_level,
+    content_hash,
+    level_progress,
+    next_recent_hashes,
+    normalize_content,
+    validate_xp_config,
+    xp_block_reason,
+    xp_threshold,
+)
 
 
 class TestLevelMath(unittest.TestCase):
@@ -143,6 +153,158 @@ class TestDatabase(unittest.TestCase):
         self.db.delete_ticket(555)
         self.assertIsNone(self.db.get_ticket(555))
         self.assertIsNone(self.db.get_open_ticket_by_owner(100, 7))
+
+
+XP_CONFIG = {
+    "xp_min": 10,
+    "xp_max": 25,
+    "xp_cooldown_seconds": 30,
+    "xp_min_length": 3,
+}
+
+
+class TestXpAntiSpam(unittest.TestCase):
+    def test_passing_message(self):
+        self.assertIsNone(
+            xp_block_reason("今日はいい天気ですね", [], 10000.0, 0.0, XP_CONFIG)
+        )
+
+    def test_cooldown(self):
+        self.assertEqual(
+            xp_block_reason(
+                "今日はいい天気ですね", [], 100.0, 90.0, XP_CONFIG
+            ),
+            "cooldown",
+        )
+        # ちょうどクールダウン経過後は通る
+        self.assertIsNone(
+            xp_block_reason(
+                "今日はいい天気ですね", [], 100.0, 70.0, XP_CONFIG
+            )
+        )
+
+    def test_no_text(self):
+        self.assertEqual(
+            xp_block_reason("", [], 10000.0, 0.0, XP_CONFIG), "no_text"
+        )
+        self.assertEqual(
+            xp_block_reason("  \n\t ", [], 10000.0, 0.0, XP_CONFIG), "no_text"
+        )
+
+    def test_too_short(self):
+        self.assertEqual(
+            xp_block_reason("ab", [], 10000.0, 0.0, XP_CONFIG), "too_short"
+        )
+        self.assertIsNone(
+            xp_block_reason("abc", [], 10000.0, 0.0, XP_CONFIG)
+        )
+
+    def test_duplicate_direct(self):
+        recent = [content_hash("hello world")]
+        self.assertEqual(
+            xp_block_reason("hello world", recent, 10000.0, 0.0, XP_CONFIG),
+            "duplicate",
+        )
+
+    def test_duplicate_a_b_a(self):
+        # A → B → A の3通目 (A の再送) は履歴に残っているので弾かれる
+        recent = []
+        recent = next_recent_hashes(recent, content_hash("メッセージAです"))
+        recent = next_recent_hashes(recent, content_hash("別のメッセージB"))
+        self.assertEqual(
+            xp_block_reason("メッセージAです", recent, 10000.0, 0.0, XP_CONFIG),
+            "duplicate",
+        )
+        # 履歴にない新しい内容は通る
+        self.assertIsNone(
+            xp_block_reason("新しいメッセージC", recent, 10000.0, 0.0, XP_CONFIG)
+        )
+
+    def test_history_eviction(self):
+        # 直近5件から押し出された古い内容は再度カウントされる
+        recent = next_recent_hashes([], content_hash("メッセージAです"))
+        for i in range(RECENT_CONTENT_HASH_LIMIT):
+            recent = next_recent_hashes(
+                recent, content_hash(f"別の発言その{i}です")
+            )
+        self.assertEqual(len(recent), RECENT_CONTENT_HASH_LIMIT)
+        self.assertNotIn(content_hash("メッセージAです"), recent)
+        self.assertIsNone(
+            xp_block_reason("メッセージAです", recent, 10000.0, 0.0, XP_CONFIG)
+        )
+
+    def test_normalization_and_hash_stability(self):
+        self.assertEqual(normalize_content("  Foo\tBar\n Baz  "), "foo bar baz")
+        self.assertEqual(
+            content_hash("  Foo\tBar\nBaz "), content_hash("foo bar baz")
+        )
+        self.assertNotEqual(content_hash("foo bar"), content_hash("foo baz"))
+
+
+class TestXpConfigValidation(unittest.TestCase):
+    def test_valid(self):
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3))
+        self.assertIsNone(validate_xp_config(0, 0, 0, 0))
+        self.assertIsNone(validate_xp_config(0, 10000, 3600, 200))
+
+    def test_invalid(self):
+        self.assertIsNotNone(validate_xp_config(26, 25, 30, 3))  # min > max
+        self.assertIsNotNone(validate_xp_config(-1, 25, 30, 3))
+        self.assertIsNotNone(validate_xp_config(10, 10001, 30, 3))
+        self.assertIsNotNone(validate_xp_config(10, 25, -1, 3))
+        self.assertIsNotNone(validate_xp_config(10, 25, 3601, 3))
+        self.assertIsNotNone(validate_xp_config(10, 25, 30, -1))
+        self.assertIsNotNone(validate_xp_config(10, 25, 30, 201))
+
+
+class TestDatabaseMigration(unittest.TestCase):
+    def test_user_xp_recent_hashes_migration(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.db")
+            conn = sqlite3.connect(path)
+            with conn:
+                # v2 初期の user_xp (recent_content_hashes 列なし)
+                conn.execute(
+                    """
+                    CREATE TABLE user_xp (
+                        user_id INTEGER NOT NULL,
+                        guild_id INTEGER NOT NULL,
+                        xp INTEGER NOT NULL DEFAULT 0,
+                        level INTEGER NOT NULL DEFAULT 0,
+                        last_message_time REAL NOT NULL DEFAULT 0,
+                        PRIMARY KEY (user_id, guild_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO user_xp VALUES (7, 100, 500, 4, 1.5)"
+                )
+            conn.close()
+
+            db = Database(path)
+
+            conn = sqlite3.connect(path)
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(user_xp)")
+            ]
+            conn.close()
+            self.assertIn("recent_content_hashes", columns)
+
+            # 既存行と XP が保持されている
+            data = db.get_xp(7, 100)
+            self.assertEqual(data["xp"], 500)
+            self.assertEqual(data["level"], 4)
+            self.assertEqual(data["recent_content_hashes"], [])
+
+            # ハッシュ履歴が往復できる
+            db.upsert_xp(
+                7, 100, 520, 4, 2.0, recent_content_hashes=["abc", "def"]
+            )
+            data = db.get_xp(7, 100)
+            self.assertEqual(data["xp"], 520)
+            self.assertEqual(data["recent_content_hashes"], ["abc", "def"])
 
 
 class TestRulesText(unittest.TestCase):

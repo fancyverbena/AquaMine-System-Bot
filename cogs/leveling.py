@@ -1,8 +1,12 @@
 """レベリング機能 (v2)。
 
-XP は発言ごと (30秒クールダウン、DB の last_message_time で判定)。
+XP は発言ごとに付与される。入手量・クールダウン・最小文字数はギルド設定
+(/level config で変更可能、DB の guild_settings に保存)。
+スパム対策として、テキストなし・短すぎる発言・直前と同一内容の連投には
+XP を付与しない (判定は xp_block_reason に集約)。
 レベル L に必要な累計 XP は 0 (L=0) または 5*L^2 + 50*L + 100。
 """
+import hashlib
 import random
 import time
 
@@ -14,10 +18,9 @@ from app import settings
 from app.db import db
 from app.ui import COLOR_GOLD, COLOR_PRIMARY, progress_bar, reply_error
 
-COOLDOWN_SECONDS = 30
-XP_MIN = 10
-XP_MAX = 25
 PAGE_SIZE = 10
+# 重複判定で保持する「XP がカウントされた発言」のハッシュ履歴件数
+RECENT_CONTENT_HASH_LIMIT = 5
 
 
 def xp_threshold(level: int) -> int:
@@ -42,6 +45,75 @@ def level_progress(total_xp: int):
     span = nxt - current
     fraction = (total_xp - current) / span if span > 0 else 0.0
     return level, fraction, nxt - total_xp
+
+
+def normalize_content(content) -> str:
+    """重複判定用に発言内容を正規化する。
+
+    前後の空白を除き、連続する空白 (改行・タブ含む) を半角スペース1つに
+    畳んで、小文字化する。
+    """
+    return " ".join((content or "").split()).casefold()
+
+
+def content_hash(content) -> str:
+    """正規化した発言内容の sha256 ハッシュ。"""
+    normalized = normalize_content(content)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def xp_block_reason(
+    content,
+    recent_hashes,
+    now: float,
+    last_message_time: float,
+    config: dict,
+):
+    """XP を付与できない理由を返す。付与できる場合は None。
+
+    理由キー: 'cooldown' / 'no_text' / 'too_short' / 'duplicate'
+    recent_hashes は「XP がカウントされた直近の発言」のハッシュ履歴
+    (最大 RECENT_CONTENT_HASH_LIMIT 件)。config は
+    settings.get_xp_config() の戻り値 (dict) を想定。
+    """
+    if now - last_message_time < config["xp_cooldown_seconds"]:
+        return "cooldown"
+    stripped = (content or "").strip()
+    if not stripped:
+        # スタンプ・添付ファイルのみ等、テキストがない発言。
+        # (絵文字だけの投稿も content が空で届くためここに含まれる。
+        #  テキスト中に絵文字が含まれる場合は通常の文字として数える)
+        return "no_text"
+    if len(stripped) < config["xp_min_length"]:
+        return "too_short"
+    if recent_hashes and content_hash(content) in recent_hashes:
+        # 直近で XP を得た発言のどれかと同一内容。間に別の発言を挟んでも、
+        # 時間を空けても、別チャンネルでも弾く (履歴はユーザー×ギルド単位)
+        return "duplicate"
+    return None
+
+
+def next_recent_hashes(recent_hashes, new_hash: str) -> list:
+    """履歴に新しいハッシュを追加し、直近 RECENT_CONTENT_HASH_LIMIT 件に保つ。"""
+    updated = list(recent_hashes or [])
+    updated.append(new_hash)
+    return updated[-RECENT_CONTENT_HASH_LIMIT:]
+
+
+def validate_xp_config(
+    xp_min: int, xp_max: int, cooldown_seconds: int, min_length: int
+):
+    """XP 設定の検証。問題があれば日本語のエラーメッセージを返す。"""
+    if not (0 <= xp_min <= xp_max <= settings.XP_HARD_MAX):
+        return (
+            f"XP入手量は 0 〜 {settings.XP_HARD_MAX} の範囲で、"
+            "最小 ≦ 最大 になるよう指定してください。"
+        )
+    if not (0 <= cooldown_seconds <= settings.COOLDOWN_HARD_MAX):
+        return f"クールダウンは 0 〜 {settings.COOLDOWN_HARD_MAX} 秒で指定してください。"
+    if not (0 <= min_length <= settings.MIN_LENGTH_HARD_MAX):
+        return f"最小文字数は 0 〜 {settings.MIN_LENGTH_HARD_MAX} で指定してください。"
+    return None
 
 
 class LeaderboardView(discord.ui.View):
@@ -105,13 +177,33 @@ class LevelingCog(commands.Cog):
 
         data = db.get_xp(user.id, guild.id, create=True)
         now = time.time()
-        if now - data["last_message_time"] < COOLDOWN_SECONDS:
+        config = settings.get_xp_config(guild.id)
+        reason = xp_block_reason(
+            message.content,
+            data["recent_content_hashes"],
+            now,
+            data["last_message_time"],
+            config,
+        )
+        if reason is not None:
+            # ブロック時は last_message_time / ハッシュ履歴を更新しない
+            # (クールダウンが延びたり、重複ブロックが自己継続したりしない)
             return
 
-        new_xp = data["xp"] + random.randint(XP_MIN, XP_MAX)
+        new_xp = data["xp"] + random.randint(config["xp_min"], config["xp_max"])
         old_level = data["level"]
         new_level = calc_level(new_xp)
-        db.upsert_xp(user.id, guild.id, new_xp, new_level, now)
+        db.upsert_xp(
+            user.id,
+            guild.id,
+            new_xp,
+            new_level,
+            now,
+            recent_content_hashes=next_recent_hashes(
+                data["recent_content_hashes"],
+                content_hash(message.content),
+            ),
+        )
 
         if new_level > old_level:
             await self._on_level_up(message, user, new_level)
@@ -183,7 +275,10 @@ class LevelingCog(commands.Cog):
             value=f"{progress_bar(fraction)} {int(fraction * 100)}%",
             inline=False,
         )
-        embed.set_footer(text="スパム防止のため、XPは30秒に1回だけ加算されます。")
+        cooldown = settings.get_xp_config(guild.id)["xp_cooldown_seconds"]
+        embed.set_footer(
+            text=f"スパム防止のため、XPは{cooldown}秒に1回だけ加算されます。"
+        )
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     # ---------- /leaderboard ----------
@@ -297,11 +392,79 @@ class LevelingCog(commands.Cog):
         new_xp = max(0, data["xp"] + amount)
         new_level = calc_level(new_xp)
         db.upsert_xp(
-            member.id, guild.id, new_xp, new_level, data["last_message_time"]
+            member.id,
+            guild.id,
+            new_xp,
+            new_level,
+            data["last_message_time"],
+            recent_content_hashes=data["recent_content_hashes"],
         )
         await interaction.response.send_message(
             f"✅ {member.mention} のXPを {data['xp']} → {new_xp} に変更しました"
             f"（Lv.{data['level']} → Lv.{new_level}）。",
+            ephemeral=True,
+        )
+
+    @level_group.command(
+        name="config",
+        description="XP入手量・クールダウン・最小文字数を変更します（指定した項目だけ更新）",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        xp_min="1回の発言で得るXPの最小値（0〜10000）",
+        xp_max="1回の発言で得るXPの最大値（0〜10000）",
+        cooldown_seconds="XPが貯まる間隔（秒、0〜3600）",
+        min_length="XP対象になる最小の文字数（0〜200）",
+    )
+    async def level_config(
+        self,
+        interaction: discord.Interaction,
+        xp_min: int = None,
+        xp_max: int = None,
+        cooldown_seconds: int = None,
+        min_length: int = None,
+    ):
+        if not self._guard_admin_guild(interaction):
+            await self._reject(interaction)
+            return
+        guild = interaction.guild
+        config = settings.get_xp_config(guild.id)
+
+        new_min = xp_min if xp_min is not None else config["xp_min"]
+        new_max = xp_max if xp_max is not None else config["xp_max"]
+        new_cooldown = (
+            cooldown_seconds
+            if cooldown_seconds is not None
+            else config["xp_cooldown_seconds"]
+        )
+        new_min_length = (
+            min_length if min_length is not None else config["xp_min_length"]
+        )
+
+        error = validate_xp_config(
+            new_min, new_max, new_cooldown, new_min_length
+        )
+        if error is not None:
+            await reply_error(interaction, error)
+            return
+
+        if xp_min is not None:
+            settings.set_value(guild.id, settings.XP_MIN, xp_min)
+        if xp_max is not None:
+            settings.set_value(guild.id, settings.XP_MAX, xp_max)
+        if cooldown_seconds is not None:
+            settings.set_value(
+                guild.id, settings.XP_COOLDOWN_SECONDS, cooldown_seconds
+            )
+        if min_length is not None:
+            settings.set_value(guild.id, settings.XP_MIN_LENGTH, min_length)
+
+        effective = settings.get_xp_config(guild.id)
+        await interaction.response.send_message(
+            "✅ レベリング設定を更新しました。\n"
+            f"・XP入手量: {effective['xp_min']} 〜 {effective['xp_max']}\n"
+            f"・クールダウン: {effective['xp_cooldown_seconds']} 秒\n"
+            f"・最小文字数: {effective['xp_min_length']} 文字",
             ephemeral=True,
         )
 

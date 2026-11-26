@@ -326,6 +326,17 @@ class AdminCog(commands.Cog):
             value=f"{auto_hours} 時間" if auto_hours > 0 else "無効",
         )
 
+        xp_config = settings.get_xp_config(gid)
+        embed.add_field(
+            name="レベリング",
+            value=(
+                f"XP {xp_config['xp_min']}〜{xp_config['xp_max']}"
+                f" / クールダウン {xp_config['xp_cooldown_seconds']}秒"
+                f" / 最小 {xp_config['xp_min_length']}文字"
+            ),
+            inline=False,
+        )
+
         level_roles = settings.get_level_roles(gid)
         if level_roles:
             lines = []
