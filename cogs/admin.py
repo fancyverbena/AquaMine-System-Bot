@@ -327,12 +327,14 @@ class AdminCog(commands.Cog):
         )
 
         xp_config = settings.get_xp_config(gid)
+        vc_xp = settings.get_vc_xp_per_minute(gid)
         embed.add_field(
             name="レベリング",
             value=(
                 f"XP {xp_config['xp_min']}〜{xp_config['xp_max']}"
                 f" / クールダウン {xp_config['xp_cooldown_seconds']}秒"
                 f" / 最小 {xp_config['xp_min_length']}文字"
+                + (f" / VC {vc_xp} XP/分" if vc_xp > 0 else " / VC 無効")
             ),
             inline=False,
         )
@@ -346,6 +348,36 @@ class AdminCog(commands.Cog):
                 + f" / NGワード {len(settings.get_automod_ngwords(gid))}件"
                 + " / ログ "
                 + (automod_log.mention if automod_log else "未設定")
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="ロールパネル",
+            value=(
+                f"{len(settings.get_role_panel_role_ids(gid))}件のロール"
+                " / 排他モード "
+                + ("ON" if settings.get_role_panel_exclusive(gid) else "OFF")
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="フィードバック",
+            value=(
+                f"提案ch: {channel_text(settings.SUGGESTION_CHANNEL_ID)}"
+                f" / バグch: {channel_text(settings.BUG_CHANNEL_ID)}"
+            ),
+            inline=False,
+        )
+
+        notify_roles = settings.get_ticket_notify_roles(gid)
+        embed.add_field(
+            name="チケット評価・担当通知",
+            value=(
+                "評価 "
+                + ("ON" if settings.get_ticket_rating_enabled(gid) else "OFF")
+                + f" / 担当通知 {len(notify_roles)}種類に設定"
             ),
             inline=False,
         )

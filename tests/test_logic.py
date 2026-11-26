@@ -2,6 +2,7 @@
 
 実行: python -m unittest discover -s tests
 """
+import json
 import os
 import sys
 import tempfile
@@ -10,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from app import settings  # noqa: E402
-from app.db import Database  # noqa: E402
+from app.db import Database, next_vote  # noqa: E402
 from app.ui import progress_bar, sanitize_channel_part  # noqa: E402
 from cogs.automod import (  # noqa: E402
     content_violation,
@@ -21,14 +22,43 @@ from cogs.automod import (  # noqa: E402
 )
 from cogs.leveling import (  # noqa: E402
     RECENT_CONTENT_HASH_LIMIT,
+    VC_TICK_SECONDS,
+    advance_vc_sessions,
     calc_level,
     content_hash,
     level_progress,
     next_recent_hashes,
     normalize_content,
     validate_xp_config,
+    vc_eligible,
     xp_block_reason,
     xp_threshold,
+)
+from cogs.bump import (  # noqa: E402
+    DISBOARD_BOT_ID,
+    extract_bumper_id,
+    is_bump_success,
+)
+from cogs.backup import is_due  # noqa: E402
+from cogs.feedback import (  # noqa: E402
+    FeedbackStatusButton,
+    FeedbackVoteButton,
+    can_transition,
+)
+from cogs.giveaway import (  # noqa: E402
+    GiveawayButton,
+    draw_winners,
+    parse_duration,
+)
+from cogs.roles import (  # noqa: E402
+    RoleButton,
+    panel_add_error,
+    toggle_actions,
+)
+from cogs.tickets import (  # noqa: E402
+    TicketRatingButton,
+    rating_block_reason,
+    valid_ticket_type,
 )
 
 
@@ -599,6 +629,1155 @@ class TestRulesText(unittest.TestCase):
         for chunk in chunks:
             self.assertLessEqual(len(chunk), 2000)
         self.assertEqual("\n".join(chunks), long_text)
+
+
+class TestRolePanelToggleActions(unittest.TestCase):
+    PANEL = [10, 20, 30]
+
+    def test_add_when_missing(self):
+        to_add, to_remove = toggle_actions([], self.PANEL, 10, False)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [])
+
+    def test_remove_when_present(self):
+        to_add, to_remove = toggle_actions([10, 20], self.PANEL, 10, False)
+        self.assertEqual(to_add, [])
+        self.assertEqual(to_remove, [10])
+
+    def test_non_exclusive_keeps_other_panel_roles(self):
+        to_add, to_remove = toggle_actions([20], self.PANEL, 10, False)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [])
+
+    def test_exclusive_removes_other_panel_roles_on_add(self):
+        to_add, to_remove = toggle_actions([20, 30], self.PANEL, 10, True)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [20, 30])
+
+    def test_exclusive_remove_does_not_touch_others(self):
+        to_add, to_remove = toggle_actions([10, 20], self.PANEL, 10, True)
+        self.assertEqual(to_add, [])
+        self.assertEqual(to_remove, [10])
+
+    def test_clicked_role_not_in_panel(self):
+        self.assertEqual(toggle_actions([], self.PANEL, 99, False), ([], []))
+        self.assertEqual(toggle_actions([99], self.PANEL, 99, True), ([], []))
+
+    def test_non_panel_roles_never_touched(self):
+        # 999 はパネル外のロール: 排他モードでも外さない
+        to_add, to_remove = toggle_actions([999, 20], self.PANEL, 10, True)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [20])
+
+
+class TestRolePanelAddError(unittest.TestCase):
+    def test_ok(self):
+        self.assertIsNone(panel_add_error([10], 20))
+        self.assertIsNone(panel_add_error([], 10))
+
+    def test_duplicate(self):
+        self.assertEqual(panel_add_error([10, 20], 20), "duplicate")
+
+    def test_full(self):
+        full = list(range(settings.MAX_ROLE_PANEL_ROLES))
+        self.assertEqual(panel_add_error(full, 9999), "full")
+        # 上限ちょうど - 1 件なら追加できる
+        almost = list(range(settings.MAX_ROLE_PANEL_ROLES - 1))
+        self.assertIsNone(panel_add_error(almost, 9999))
+
+
+class TestRolePanelSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_role_ids_default_empty(self):
+        self.assertEqual(settings.get_role_panel_role_ids(1), [])
+
+    def test_role_ids_round_trip_preserves_order(self):
+        settings.set_value(1, settings.ROLE_PANEL_ROLE_IDS, [30, 10, 20])
+        self.assertEqual(settings.get_role_panel_role_ids(1), [30, 10, 20])
+        # ギルドごとに独立
+        self.assertEqual(settings.get_role_panel_role_ids(2), [])
+
+    def test_role_ids_corrupt_fallback(self):
+        settings.set_value(1, settings.ROLE_PANEL_ROLE_IDS, "not-a-list")
+        self.assertEqual(settings.get_role_panel_role_ids(1), [])
+        # 混在した要素は数値化できるものだけ残る
+        settings.set_value(1, settings.ROLE_PANEL_ROLE_IDS, [10, "x", "20"])
+        self.assertEqual(settings.get_role_panel_role_ids(1), [10, 20])
+
+    def test_exclusive_default_and_round_trip(self):
+        self.assertFalse(settings.get_role_panel_exclusive(1))
+        settings.set_value(1, settings.ROLE_PANEL_EXCLUSIVE, True)
+        self.assertTrue(settings.get_role_panel_exclusive(1))
+        settings.set_value(1, settings.ROLE_PANEL_EXCLUSIVE, False)
+        self.assertFalse(settings.get_role_panel_exclusive(1))
+
+    def test_exclusive_corrupt_fallback(self):
+        settings.set_value(1, settings.ROLE_PANEL_EXCLUSIVE, "yes")
+        self.assertFalse(settings.get_role_panel_exclusive(1))
+
+
+class TestRoleButtonDynamicItem(unittest.TestCase):
+    def test_custom_id_and_template(self):
+        button = RoleButton(123456, label="テスト")
+        self.assertEqual(button.custom_id, "v2:role:123456")
+        self.assertEqual(button.role_id, 123456)
+        match = button.template.fullmatch("v2:role:789")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["role_id"], "789")
+        # 他のパネルの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:agree"))
+        self.assertIsNone(button.template.fullmatch("v2:role:abc"))
+
+
+class TestGiveawayParseDuration(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(parse_duration("30s"), 30)
+        self.assertEqual(parse_duration("10m"), 600)
+        self.assertEqual(parse_duration("2h"), 7200)
+        self.assertEqual(parse_duration("1d"), 86400)
+        # 24h と 1d は等しい
+        self.assertEqual(parse_duration("24h"), 86400)
+
+    def test_case_and_whitespace(self):
+        self.assertEqual(parse_duration(" 10M "), 600)
+        self.assertEqual(parse_duration("2H"), 7200)
+        self.assertEqual(parse_duration(" 1d"), 86400)
+
+    def test_range_boundaries(self):
+        self.assertEqual(parse_duration("10s"), 10)
+        self.assertEqual(parse_duration("30d"), 30 * 24 * 3600)
+
+    def test_out_of_range(self):
+        self.assertIsNone(parse_duration("9s"))
+        self.assertIsNone(parse_duration("0m"))
+        self.assertIsNone(parse_duration("31d"))
+
+    def test_invalid(self):
+        self.assertIsNone(parse_duration(""))
+        self.assertIsNone(parse_duration("abc"))
+        self.assertIsNone(parse_duration("10"))
+        self.assertIsNone(parse_duration("10x"))
+        self.assertIsNone(parse_duration("1.5h"))
+        self.assertIsNone(parse_duration("-5m"))
+        self.assertIsNone(parse_duration("10mm"))
+        self.assertIsNone(parse_duration("10分"))
+        self.assertIsNone(parse_duration(None))
+
+
+class TestGiveawayDrawWinners(unittest.TestCase):
+    def test_seeded_draw(self):
+        import random
+
+        entries = [101, 102, 103, 104, 105, 106]
+        winners = draw_winners(entries, 3, rng=random.Random(42))
+        self.assertEqual(len(winners), 3)
+        # 重複なし・全員が参加者の中から選ばれている
+        self.assertEqual(len(set(winners)), 3)
+        self.assertTrue(set(winners) <= set(entries))
+        # 同じシードでは再現する
+        again = draw_winners(entries, 3, rng=random.Random(42))
+        self.assertEqual(winners, again)
+
+    def test_more_winners_than_entries(self):
+        self.assertEqual(sorted(draw_winners([7, 8], 5)), [7, 8])
+
+    def test_all_entries_win_when_equal(self):
+        self.assertEqual(sorted(draw_winners([1, 2, 3], 3)), [1, 2, 3])
+
+    def test_empty_entries(self):
+        self.assertEqual(draw_winners([], 3), [])
+        self.assertEqual(draw_winners(None, 3), [])
+
+
+class TestGiveawayDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _create(self, guild_id=100, ends_at=2000.0, now=1000.0):
+        return self.db.create_giveaway(
+            guild_id, 555, 999, "ダイヤ装備", 2, ends_at, now
+        )
+
+    def test_create_get_round_trip(self):
+        gid = self._create()
+        row = self.db.get_giveaway(gid)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["channel_id"], 555)
+        self.assertIsNone(row["message_id"])
+        self.assertEqual(row["host_id"], 999)
+        self.assertEqual(row["prize"], "ダイヤ装備")
+        self.assertEqual(row["winner_count"], 2)
+        self.assertEqual(row["ends_at"], 2000.0)
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["winners"], [])
+        self.assertIsNone(self.db.get_giveaway(99999))
+
+        self.db.set_giveaway_message(gid, 777)
+        self.assertEqual(self.db.get_giveaway(gid)["message_id"], 777)
+
+    def test_toggle_entry(self):
+        gid = self._create()
+        # 参加 → True、もう一度 → 取り消しで False
+        self.assertTrue(self.db.toggle_entry(gid, 7, 1000.0))
+        self.assertEqual(self.db.count_entries(gid), 1)
+        self.assertFalse(self.db.toggle_entry(gid, 7, 1001.0))
+        self.assertEqual(self.db.count_entries(gid), 0)
+        # 別のユーザーは独立
+        self.assertTrue(self.db.toggle_entry(gid, 7, 1002.0))
+        self.assertTrue(self.db.toggle_entry(gid, 8, 1003.0))
+        self.assertEqual(self.db.count_entries(gid), 2)
+        self.assertEqual(self.db.list_entry_user_ids(gid), [7, 8])
+        # 他の抽選には影響しない
+        other = self._create()
+        self.assertEqual(self.db.count_entries(other), 0)
+
+    def test_list_active_and_overdue(self):
+        past = self._create(ends_at=500.0)
+        future = self._create(ends_at=5000.0)
+        other_guild = self._create(guild_id=200, ends_at=500.0)
+
+        active = self.db.list_active_giveaways(100)
+        self.assertEqual([r["id"] for r in active], [past, future])
+
+        overdue = self.db.list_overdue_giveaways(1000.0)
+        self.assertEqual([r["id"] for r in overdue], [past, other_guild])
+
+        # 終了したものはどちらにも出ない
+        self.db.finish_giveaway(past, "ended", [7])
+        self.assertEqual(
+            [r["id"] for r in self.db.list_overdue_giveaways(1000.0)],
+            [other_guild],
+        )
+        self.assertEqual(
+            [r["id"] for r in self.db.list_active_giveaways(100)], [future]
+        )
+
+    def test_finish_stores_winners(self):
+        gid = self._create()
+        self.db.finish_giveaway(gid, "ended", [7, 8])
+        row = self.db.get_giveaway(gid)
+        self.assertEqual(row["status"], "ended")
+        self.assertEqual(row["winners"], [7, 8])
+        # キャンセル時は当選者なし
+        gid2 = self._create()
+        self.db.finish_giveaway(gid2, "cancelled", [])
+        row2 = self.db.get_giveaway(gid2)
+        self.assertEqual(row2["status"], "cancelled")
+        self.assertEqual(row2["winners"], [])
+
+
+class TestVcEligible(unittest.TestCase):
+    def test_all_good(self):
+        self.assertTrue(
+            vc_eligible(
+                is_bot=False,
+                is_afk_channel=False,
+                self_deaf=False,
+                deaf=False,
+                human_count=2,
+            )
+        )
+        self.assertTrue(
+            vc_eligible(
+                is_bot=False,
+                is_afk_channel=False,
+                self_deaf=False,
+                deaf=False,
+                human_count=5,
+            )
+        )
+
+    def test_bot_excluded(self):
+        self.assertFalse(vc_eligible(True, False, False, False, 3))
+
+    def test_afk_channel_excluded(self):
+        self.assertFalse(vc_eligible(False, True, False, False, 3))
+
+    def test_self_deaf_excluded(self):
+        self.assertFalse(vc_eligible(False, False, True, False, 3))
+
+    def test_server_deaf_excluded(self):
+        self.assertFalse(vc_eligible(False, False, False, True, 3))
+
+    def test_alone_excluded(self):
+        self.assertFalse(vc_eligible(False, False, False, False, 1))
+        self.assertFalse(vc_eligible(False, False, False, False, 0))
+
+
+class TestVcSessions(unittest.TestCase):
+    KEY = (100, 200)
+
+    def test_young_session_gets_no_grant(self):
+        sessions = {self.KEY: 1000.0}
+        grants, updated = advance_vc_sessions(
+            sessions, 1000.0 + VC_TICK_SECONDS - 1, {self.KEY}
+        )
+        self.assertEqual(grants, [])
+        # 開始時刻はそのまま保持される
+        self.assertEqual(updated, {self.KEY: 1000.0})
+
+    def test_due_session_gets_one_grant_and_clock_resets(self):
+        sessions = {self.KEY: 1000.0}
+        now = 1000.0 + VC_TICK_SECONDS
+        grants, updated = advance_vc_sessions(sessions, now, {self.KEY})
+        self.assertEqual(grants, [self.KEY])
+        self.assertEqual(updated, {self.KEY: now})
+
+    def test_long_session_still_one_grant_per_tick(self):
+        # 5分経っていても1ティックの付与は1分分だけ (端数は持ち越さない)
+        sessions = {self.KEY: 1000.0}
+        now = 1000.0 + 5 * VC_TICK_SECONDS
+        grants, updated = advance_vc_sessions(sessions, now, {self.KEY})
+        self.assertEqual(grants, [self.KEY])
+        self.assertEqual(updated, {self.KEY: now})
+
+    def test_ineligible_session_dropped_without_grant(self):
+        # 60秒以上経過していても、対象でなくなっていれば破棄のみ
+        sessions = {self.KEY: 1000.0}
+        grants, updated = advance_vc_sessions(
+            sessions, 1000.0 + 10 * VC_TICK_SECONDS, set()
+        )
+        self.assertEqual(grants, [])
+        self.assertEqual(updated, {})
+
+    def test_mixed_sessions(self):
+        due = (100, 1)
+        young = (100, 2)
+        gone = (100, 3)
+        sessions = {due: 0.0, young: 1000.0, gone: 0.0}
+        grants, updated = advance_vc_sessions(
+            sessions, 1000.0 + 30, {due, young}
+        )
+        self.assertEqual(grants, [due])
+        self.assertEqual(updated[due], 1030.0)
+        self.assertEqual(updated[young], 1000.0)
+        self.assertNotIn(gone, updated)
+
+
+class TestVcXpSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_default(self):
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+
+    def test_round_trip(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 5)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 5)
+        # ギルドごとに独立
+        self.assertEqual(settings.get_vc_xp_per_minute(2), 2)
+
+    def test_zero_means_disabled(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 0)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 0)
+
+    def test_corrupt_fallback(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, "abc")
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+
+    def test_out_of_range_fallback(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 1001)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, -1)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+        # 境界値は有効
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 1000)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 1000)
+
+
+class TestVcXpConfigValidation(unittest.TestCase):
+    def test_vc_field_valid(self):
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, 0))
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, 2))
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, 1000))
+        # 省略時 (None) は VC 検証をスキップし、既存の検証はそのまま効く
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3))
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, None))
+
+    def test_vc_field_invalid(self):
+        self.assertIsNotNone(validate_xp_config(10, 25, 30, 3, -1))
+        self.assertIsNotNone(validate_xp_config(10, 25, 30, 3, 1001))
+
+
+class TestGiveawayButtonDynamicItem(unittest.TestCase):
+    def test_custom_id_and_template(self):
+        button = GiveawayButton(42)
+        self.assertEqual(button.custom_id, "v2:giveaway:42")
+        self.assertEqual(button.giveaway_id, 42)
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:giveaway:123")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["giveaway_id"], "123")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:123"))
+        self.assertIsNone(button.template.fullmatch("v2:agree"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:abc"))
+
+
+class TestNextVote(unittest.TestCase):
+    def test_new_vote(self):
+        self.assertEqual(next_vote(None, 1), 1)
+        self.assertEqual(next_vote(None, -1), -1)
+
+    def test_same_side_removes(self):
+        self.assertIsNone(next_vote(1, 1))
+        self.assertIsNone(next_vote(-1, -1))
+
+    def test_opposite_side_switches(self):
+        self.assertEqual(next_vote(1, -1), -1)
+        self.assertEqual(next_vote(-1, 1), 1)
+
+
+class TestFeedbackTransitions(unittest.TestCase):
+    def test_suggestion_valid(self):
+        self.assertTrue(can_transition("suggestion", "pending", "adopted"))
+        self.assertTrue(can_transition("suggestion", "pending", "rejected"))
+
+    def test_suggestion_invalid(self):
+        # 提案に存在しないステータス
+        self.assertFalse(can_transition("suggestion", "pending", "working"))
+        self.assertFalse(can_transition("suggestion", "pending", "fixed"))
+        self.assertFalse(can_transition("suggestion", "pending", "pending"))
+
+    def test_bug_valid(self):
+        self.assertTrue(can_transition("bug", "open", "working"))
+        self.assertTrue(can_transition("bug", "open", "fixed"))
+        self.assertTrue(can_transition("bug", "open", "rejected"))
+        self.assertTrue(can_transition("bug", "working", "fixed"))
+        self.assertTrue(can_transition("bug", "working", "rejected"))
+
+    def test_bug_invalid(self):
+        self.assertFalse(can_transition("bug", "open", "adopted"))
+        self.assertFalse(can_transition("bug", "working", "open"))
+        self.assertFalse(can_transition("bug", "open", "open"))
+
+    def test_terminal_states_reject_everything(self):
+        for kind, terminal in (
+            ("suggestion", "adopted"),
+            ("suggestion", "rejected"),
+            ("bug", "fixed"),
+            ("bug", "rejected"),
+        ):
+            for target in ("pending", "open", "working", "adopted", "fixed", "rejected"):
+                self.assertFalse(
+                    can_transition(kind, terminal, target),
+                    f"{kind} {terminal} -> {target}",
+                )
+
+    def test_unknown_kind(self):
+        self.assertFalse(can_transition("unknown", "pending", "adopted"))
+
+
+class TestFeedbackDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _suggestion(self, guild_id=100, author_id=7, content="新しいイベントがほしい"):
+        return self.db.create_feedback(
+            guild_id, "suggestion", author_id, "", content, 555, 1000.0
+        )
+
+    def _bug(self, guild_id=100, author_id=8, title="ログインできない"):
+        return self.db.create_feedback(
+            guild_id, "bug", author_id, title, "手順の詳細", 666, 1001.0
+        )
+
+    def test_create_get_round_trip_suggestion(self):
+        fid = self._suggestion()
+        row = self.db.get_feedback(fid)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["kind"], "suggestion")
+        self.assertEqual(row["author_id"], 7)
+        self.assertEqual(row["title"], "")
+        self.assertEqual(row["content"], "新しいイベントがほしい")
+        self.assertEqual(row["channel_id"], 555)
+        self.assertIsNone(row["message_id"])
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["created_at"], 1000.0)
+        self.assertIsNone(self.db.get_feedback(99999))
+
+    def test_create_get_round_trip_bug(self):
+        fid = self._bug()
+        row = self.db.get_feedback(fid)
+        self.assertEqual(row["kind"], "bug")
+        self.assertEqual(row["title"], "ログインできない")
+        self.assertEqual(row["status"], "open")
+
+    def test_message_and_status_updates(self):
+        fid = self._suggestion()
+        self.db.set_feedback_message(fid, 777)
+        self.assertEqual(self.db.get_feedback(fid)["message_id"], 777)
+        self.db.set_feedback_status(fid, "adopted")
+        self.assertEqual(self.db.get_feedback(fid)["status"], "adopted")
+
+    def test_votes_toggle_switch_remove(self):
+        fid = self._suggestion()
+        self.assertEqual(self.db.count_votes(fid), (0, 0))
+        # 投票 → 集計に反映
+        self.assertEqual(self.db.set_vote(fid, 1, 1), (1, 0))
+        self.assertEqual(self.db.set_vote(fid, 2, 1), (2, 0))
+        self.assertEqual(self.db.set_vote(fid, 3, -1), (2, 1))
+        # 反対側へ切り替え
+        self.assertEqual(self.db.set_vote(fid, 1, -1), (1, 2))
+        # 同じ側をもう一度 → 取り消し
+        self.assertEqual(self.db.set_vote(fid, 1, -1), (1, 1))
+        self.assertEqual(self.db.set_vote(fid, 2, 1), (0, 1))
+        self.assertEqual(self.db.count_votes(fid), (0, 1))
+        # 投稿者本人も投票できる (author_id=7)
+        self.assertEqual(self.db.set_vote(fid, 7, 1), (1, 1))
+        # 他の投稿には影響しない
+        other = self._suggestion()
+        self.assertEqual(self.db.count_votes(other), (0, 0))
+
+    def test_list_filtering(self):
+        s1 = self._suggestion()
+        b1 = self._bug()
+        s2 = self._suggestion(content="別の提案")
+        other_guild = self._suggestion(guild_id=200)
+
+        all_rows = self.db.list_feedback(100)
+        self.assertEqual([r["id"] for r in all_rows], [s2, b1, s1])
+
+        suggestions = self.db.list_feedback(100, kind="suggestion")
+        self.assertEqual([r["id"] for r in suggestions], [s2, s1])
+
+        bugs = self.db.list_feedback(100, kind="bug")
+        self.assertEqual([r["id"] for r in bugs], [b1])
+
+        limited = self.db.list_feedback(100, limit=2)
+        self.assertEqual([r["id"] for r in limited], [s2, b1])
+
+        self.assertEqual(
+            [r["id"] for r in self.db.list_feedback(200)], [other_guild]
+        )
+        self.assertEqual(self.db.list_feedback(300), [])
+
+
+class TestFeedbackSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_channel_ids_default_unset(self):
+        self.assertEqual(settings.get_suggestion_channel_id(1), 0)
+        self.assertEqual(settings.get_bug_channel_id(1), 0)
+
+    def test_channel_ids_round_trip(self):
+        settings.set_value(1, settings.SUGGESTION_CHANNEL_ID, 123)
+        settings.set_value(1, settings.BUG_CHANNEL_ID, 456)
+        self.assertEqual(settings.get_suggestion_channel_id(1), 123)
+        self.assertEqual(settings.get_bug_channel_id(1), 456)
+        # ギルドごとに独立
+        self.assertEqual(settings.get_suggestion_channel_id(2), 0)
+
+    def test_channel_ids_corrupt_fallback(self):
+        settings.set_value(1, settings.SUGGESTION_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_suggestion_channel_id(1), 0)
+        settings.set_value(1, settings.BUG_CHANNEL_ID, -5)
+        self.assertEqual(settings.get_bug_channel_id(1), 0)
+
+
+class TestFeedbackButtonsDynamicItem(unittest.TestCase):
+    def test_vote_button_custom_id_and_template(self):
+        button = FeedbackVoteButton(42, "up", 3)
+        self.assertEqual(button.custom_id, "v2:fbvote:42:up")
+        self.assertEqual(button.feedback_id, 42)
+        self.assertEqual(button.side, "up")
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:fbvote:123:down")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["feedback_id"], "123")
+        self.assertEqual(match["side"], "down")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:123"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:123"))
+        self.assertIsNone(button.template.fullmatch("v2:fbstatus:42:adopted"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:42:left"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:abc:up"))
+
+    def test_status_button_custom_id_and_template(self):
+        button = FeedbackStatusButton(42, "adopted")
+        self.assertEqual(button.custom_id, "v2:fbstatus:42:adopted")
+        self.assertEqual(button.feedback_id, 42)
+        self.assertEqual(button.status_key, "adopted")
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:fbstatus:7:working")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["feedback_id"], "7")
+        self.assertEqual(match["status"], "working")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:42"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:42"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:42:up"))
+        self.assertIsNone(button.template.fullmatch("v2:fbstatus:abc:fixed"))
+
+
+class TestBumpDetection(unittest.TestCase):
+    def test_disboard_japanese_marker(self):
+        self.assertTrue(
+            is_bump_success(
+                DISBOARD_BOT_ID, ["サーバーの表示順をアップしました！"]
+            )
+        )
+        self.assertTrue(
+            is_bump_success(DISBOARD_BOT_ID, ["表示順をアップしたよ"])
+        )
+
+    def test_disboard_english_marker(self):
+        self.assertTrue(
+            is_bump_success(DISBOARD_BOT_ID, ["Bump done! :thumbsup:"])
+        )
+        self.assertTrue(
+            is_bump_success(DISBOARD_BOT_ID, ["<@7> bumped the server!"])
+        )
+
+    def test_disboard_unrelated_embed(self):
+        self.assertFalse(
+            is_bump_success(DISBOARD_BOT_ID, ["DISBOARD のお知らせです"])
+        )
+
+    def test_other_author_with_marker(self):
+        self.assertFalse(
+            is_bump_success(123456789, ["サーバーの表示順をアップしました"])
+        )
+        self.assertFalse(is_bump_success(123456789, ["Bump done!"]))
+
+    def test_no_embeds(self):
+        self.assertFalse(is_bump_success(DISBOARD_BOT_ID, []))
+        self.assertFalse(is_bump_success(DISBOARD_BOT_ID, None))
+        self.assertFalse(is_bump_success(DISBOARD_BOT_ID, [None, ""]))
+
+    def test_marker_in_any_embed(self):
+        descriptions = ["関係ない文", "サーバーの表示順をアップしました"]
+        self.assertTrue(is_bump_success(DISBOARD_BOT_ID, descriptions))
+
+
+class TestBumpExtractBumper(unittest.TestCase):
+    def test_mention_present(self):
+        self.assertEqual(
+            extract_bumper_id("<@123456> が表示順をアップしました"), 123456
+        )
+
+    def test_nickname_mention_present(self):
+        self.assertEqual(extract_bumper_id("<@!987654> bumped"), 987654)
+
+    def test_mention_absent(self):
+        self.assertIsNone(extract_bumper_id("表示順をアップしました"))
+        self.assertIsNone(extract_bumper_id(""))
+        self.assertIsNone(extract_bumper_id(None))
+
+
+class TestBumpReminderDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_set_get_round_trip(self):
+        self.db.set_bump_reminder(100, 555, 777, 2000.0)
+        row = self.db.get_bump_reminder(100)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["channel_id"], 555)
+        self.assertEqual(row["bumper_id"], 777)
+        self.assertEqual(row["remind_at"], 2000.0)
+        self.assertIsNone(self.db.get_bump_reminder(999))
+
+    def test_bumper_nullable(self):
+        self.db.set_bump_reminder(100, 555, None, 2000.0)
+        self.assertIsNone(self.db.get_bump_reminder(100)["bumper_id"])
+
+    def test_overwrite_resets_reminder(self):
+        self.db.set_bump_reminder(100, 555, 777, 2000.0)
+        self.db.set_bump_reminder(100, 666, 888, 5000.0)
+        row = self.db.get_bump_reminder(100)
+        self.assertEqual(row["channel_id"], 666)
+        self.assertEqual(row["bumper_id"], 888)
+        self.assertEqual(row["remind_at"], 5000.0)
+
+    def test_due_selection(self):
+        self.db.set_bump_reminder(100, 555, 777, 1500.0)  # 期限切れ
+        self.db.set_bump_reminder(200, 556, 778, 2500.0)  # まだ先
+        due = self.db.get_due_bump_reminders(2000.0)
+        self.assertEqual([r["guild_id"] for r in due], [100])
+        # 時刻ちょうども期限として扱う
+        due = self.db.get_due_bump_reminders(2500.0)
+        self.assertEqual([r["guild_id"] for r in due], [100, 200])
+
+    def test_clear(self):
+        self.db.set_bump_reminder(100, 555, 777, 1500.0)
+        self.db.clear_bump_reminder(100)
+        self.assertIsNone(self.db.get_bump_reminder(100))
+        self.assertEqual(self.db.get_due_bump_reminders(2000.0), [])
+
+    def test_per_guild_isolation(self):
+        self.db.set_bump_reminder(100, 555, 777, 1500.0)
+        self.db.set_bump_reminder(200, 556, 778, 1600.0)
+        self.db.clear_bump_reminder(100)
+        self.assertIsNone(self.db.get_bump_reminder(100))
+        self.assertEqual(self.db.get_bump_reminder(200)["channel_id"], 556)
+
+
+class TestBumpSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_enabled_default_true(self):
+        self.assertTrue(settings.get_bump_reminder_enabled(1))
+
+    def test_enabled_round_trip(self):
+        settings.set_value(1, settings.BUMP_REMINDER_ENABLED, False)
+        self.assertFalse(settings.get_bump_reminder_enabled(1))
+        settings.set_value(1, settings.BUMP_REMINDER_ENABLED, True)
+        self.assertTrue(settings.get_bump_reminder_enabled(1))
+        # ギルドごとに独立
+        self.assertTrue(settings.get_bump_reminder_enabled(2))
+
+    def test_enabled_corrupt_fallback_true(self):
+        settings.set_value(1, settings.BUMP_REMINDER_ENABLED, "abc")
+        self.assertTrue(settings.get_bump_reminder_enabled(1))
+
+    def test_notify_role_default_unset(self):
+        self.assertEqual(settings.get_bump_notify_role_id(1), 0)
+
+    def test_notify_role_round_trip(self):
+        settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, 424242)
+        self.assertEqual(settings.get_bump_notify_role_id(1), 424242)
+        self.assertEqual(settings.get_bump_notify_role_id(2), 0)
+
+    def test_notify_role_corrupt_fallback(self):
+        settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, "abc")
+        self.assertEqual(settings.get_bump_notify_role_id(1), 0)
+        settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, -5)
+        self.assertEqual(settings.get_bump_notify_role_id(1), 0)
+
+
+class TestDatabaseBackup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_backup_to_copies_rows_and_tables(self):
+        import sqlite3
+
+        self.db.set_setting(123, "some_key", "some_value")
+        self.db.upsert_xp(42, 123, 500, 3, 0.0)
+        dest = os.path.join(self.tmp.name, "backup.db")
+        self.db.backup_to(dest)
+
+        self.assertTrue(os.path.exists(dest))
+        with sqlite3.connect(dest) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT value FROM guild_settings"
+                " WHERE guild_id = 123 AND key = 'some_key'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(json.loads(row["value"]), "some_value")
+            xp_row = conn.execute(
+                "SELECT xp, level FROM user_xp"
+                " WHERE user_id = 42 AND guild_id = 123"
+            ).fetchone()
+            self.assertIsNotNone(xp_row)
+            self.assertEqual(xp_row["xp"], 500)
+            self.assertEqual(xp_row["level"], 3)
+            tables = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        for expected in (
+            "guild_settings",
+            "user_xp",
+            "tickets",
+            "infractions",
+            "giveaways",
+            "feedback",
+            "bump_reminders",
+        ):
+            self.assertIn(expected, tables)
+
+    def test_backup_to_creates_parent_directory(self):
+        dest = os.path.join(self.tmp.name, "nested", "dir", "backup.db")
+        self.db.backup_to(dest)
+        self.assertTrue(os.path.exists(dest))
+
+
+class TestBackupIsDue(unittest.TestCase):
+    def test_never_run_is_due(self):
+        self.assertTrue(is_due(None, 1_000_000.0, 24))
+        self.assertTrue(is_due(0, 1_000_000.0, 24))
+        self.assertTrue(is_due(0.0, 1_000_000.0, 1))
+
+    def test_just_ran_is_not_due(self):
+        now = 1_000_000.0
+        self.assertFalse(is_due(now, now, 24))
+        self.assertFalse(is_due(now - 3600, now, 24))
+
+    def test_interval_elapsed_is_due(self):
+        now = 1_000_000.0
+        self.assertTrue(is_due(now - 24 * 3600, now, 24))
+        self.assertTrue(is_due(now - 25 * 3600, now, 24))
+        # 境界の手前はまだ
+        self.assertFalse(is_due(now - 24 * 3600 + 1, now, 24))
+
+    def test_zero_or_negative_interval_never_due(self):
+        now = 1_000_000.0
+        self.assertFalse(is_due(None, now, 0))
+        self.assertFalse(is_due(0, now, 0))
+        self.assertFalse(is_due(now - 10 * 24 * 3600, now, 0))
+        self.assertFalse(is_due(None, now, -1))
+
+
+class TestBackupSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_channel_default_unset(self):
+        self.assertEqual(settings.get_backup_channel_id(1), 0)
+
+    def test_channel_round_trip(self):
+        settings.set_value(1, settings.BACKUP_CHANNEL_ID, 987654)
+        self.assertEqual(settings.get_backup_channel_id(1), 987654)
+        self.assertEqual(settings.get_backup_channel_id(2), 0)
+
+    def test_channel_corrupt_fallback(self):
+        settings.set_value(1, settings.BACKUP_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_backup_channel_id(1), 0)
+        settings.set_value(1, settings.BACKUP_CHANNEL_ID, -5)
+        self.assertEqual(settings.get_backup_channel_id(1), 0)
+
+    def test_interval_default_24(self):
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+
+    def test_interval_round_trip(self):
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 6)
+        self.assertEqual(settings.get_backup_interval_hours(1), 6)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 0)
+        self.assertEqual(settings.get_backup_interval_hours(1), 0)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 168)
+        self.assertEqual(settings.get_backup_interval_hours(1), 168)
+        self.assertEqual(settings.get_backup_interval_hours(2), 24)
+
+    def test_interval_out_of_range_fallback(self):
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 169)
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, -1)
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, "abc")
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+
+    def test_last_at_default_and_round_trip(self):
+        self.assertEqual(settings.get_backup_last_at(1), 0.0)
+        settings.set_value(1, settings.BACKUP_LAST_AT, 1700000000.5)
+        self.assertEqual(settings.get_backup_last_at(1), 1700000000.5)
+        self.assertEqual(settings.get_backup_last_at(2), 0.0)
+
+
+try:
+    import io as _io
+
+    from PIL import Image as _PILImage
+
+    from app.rankcard import (
+        CARD_HEIGHT as _CARD_HEIGHT,
+        CARD_WIDTH as _CARD_WIDTH,
+        generate_rank_card as _generate_rank_card,
+        load_font as _load_font,
+    )
+
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+
+@unittest.skipUnless(_HAS_PIL, "Pillow がインストールされていない")
+class TestRankCard(unittest.TestCase):
+    def _dummy_avatar(self):
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (128, 128), (200, 60, 60)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _generate(self, avatar_bytes):
+        return _generate_rank_card(
+            display_name="テストユーザー",
+            level=5,
+            rank_position=2,
+            total_xp=777,
+            fraction=0.5,
+            remaining_xp=68,
+            next_level=6,
+            next_threshold=845,
+            avatar_bytes=avatar_bytes,
+        )
+
+    def test_card_with_avatar(self):
+        png = self._generate(self._dummy_avatar())
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(png), 5000)
+        img = _PILImage.open(_io.BytesIO(png))
+        self.assertEqual(img.size, (_CARD_WIDTH, _CARD_HEIGHT))
+
+    def test_card_without_avatar_uses_fallback(self):
+        png = self._generate(None)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(png), 5000)
+        img = _PILImage.open(_io.BytesIO(png))
+        self.assertEqual(img.size, (_CARD_WIDTH, _CARD_HEIGHT))
+
+    def test_card_with_broken_avatar_bytes_uses_fallback(self):
+        png = self._generate(b"not-a-png")
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_load_font_never_raises(self):
+        self.assertIsNotNone(_load_font(24))
+        self.assertIsNotNone(_load_font(24, bold=True))
+
+
+class TestTicketRatingDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _prompt(self, ticket_id=555, guild_id=100, user_id=7):
+        return self.db.create_ticket_rating_prompt(
+            ticket_id, guild_id, user_id, 1000.0
+        )
+
+    def test_prompt_and_complete_round_trip(self):
+        self.assertTrue(self._prompt())
+        row = self.db.get_ticket_rating(555)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["user_id"], 7)
+        self.assertEqual(row["rating"], 0)  # 評価待ち
+        self.assertTrue(self.db.complete_ticket_rating(555, 7, 4, 2000.0))
+        row = self.db.get_ticket_rating(555)
+        self.assertEqual(row["rating"], 4)
+        self.assertEqual(row["created_at"], 2000.0)
+        self.assertIsNone(self.db.get_ticket_rating(99999))
+
+    def test_duplicate_prompt_ignored(self):
+        self.assertTrue(self._prompt())
+        self.assertFalse(self._prompt())
+        # 評価済みの行にもプロンプトは作れない
+        self.assertTrue(self.db.complete_ticket_rating(555, 7, 5, 2000.0))
+        self.assertFalse(self._prompt())
+
+    def test_complete_without_prompt_fails(self):
+        self.assertFalse(self.db.complete_ticket_rating(555, 7, 3, 2000.0))
+        self.assertIsNone(self.db.get_ticket_rating(555))
+
+    def test_double_rating_rejected(self):
+        self._prompt()
+        self.assertTrue(self.db.complete_ticket_rating(555, 7, 2, 2000.0))
+        # 2回目は確定できず、最初の評価が残る
+        self.assertFalse(self.db.complete_ticket_rating(555, 7, 5, 3000.0))
+        self.assertEqual(self.db.get_ticket_rating(555)["rating"], 2)
+
+    def test_other_user_cannot_complete(self):
+        self._prompt(user_id=7)
+        self.assertFalse(self.db.complete_ticket_rating(555, 8, 5, 2000.0))
+        self.assertEqual(self.db.get_ticket_rating(555)["rating"], 0)
+
+    def test_stars_out_of_range_raise(self):
+        self._prompt()
+        for bad in (0, 6, -1):
+            with self.assertRaises(ValueError):
+                self.db.complete_ticket_rating(555, 7, bad, 2000.0)
+        self.assertEqual(self.db.get_ticket_rating(555)["rating"], 0)
+
+    def test_delete_prompt(self):
+        self._prompt()
+        self.db.delete_ticket_rating(555)
+        self.assertIsNone(self.db.get_ticket_rating(555))
+
+    def test_stats_math(self):
+        # ギルド100: ⭐5, ⭐4, ⭐4 と評価待ち1件 (集計対象外)
+        for ticket_id, user_id, stars in ((1, 7, 5), (2, 8, 4), (3, 9, 4)):
+            self._prompt(ticket_id=ticket_id, user_id=user_id)
+            self.assertTrue(
+                self.db.complete_ticket_rating(ticket_id, user_id, stars, 2000.0)
+            )
+        self._prompt(ticket_id=4, user_id=10)
+        # ギルド200: ⭐1 が1件 (ギルド100の集計に混ざらない)
+        self._prompt(ticket_id=5, guild_id=200, user_id=11)
+        self.assertTrue(self.db.complete_ticket_rating(5, 11, 1, 2000.0))
+
+        stats = self.db.ticket_rating_stats(100)
+        self.assertEqual(stats["count"], 3)
+        self.assertAlmostEqual(stats["average"], 13 / 3)
+        self.assertEqual(
+            stats["distribution"], {1: 0, 2: 0, 3: 0, 4: 2, 5: 1}
+        )
+
+        stats200 = self.db.ticket_rating_stats(200)
+        self.assertEqual(stats200["count"], 1)
+        self.assertEqual(stats200["average"], 1.0)
+
+    def test_stats_empty_guild(self):
+        stats = self.db.ticket_rating_stats(100)
+        self.assertEqual(stats["count"], 0)
+        self.assertEqual(stats["average"], 0.0)
+        self.assertEqual(
+            stats["distribution"], {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        )
+
+
+class TestTicketRatingDecision(unittest.TestCase):
+    def _row(self, user_id=7, rating=0):
+        return {
+            "ticket_id": 555,
+            "guild_id": 100,
+            "user_id": user_id,
+            "rating": rating,
+            "created_at": 1000.0,
+        }
+
+    def test_ok(self):
+        self.assertIsNone(rating_block_reason(self._row(), 7, 1))
+        self.assertIsNone(rating_block_reason(self._row(), 7, 5))
+
+    def test_missing_row(self):
+        self.assertIsNotNone(rating_block_reason(None, 7, 3))
+
+    def test_non_creator_rejected(self):
+        self.assertIsNotNone(rating_block_reason(self._row(), 8, 3))
+
+    def test_already_rated_rejected(self):
+        self.assertIsNotNone(rating_block_reason(self._row(rating=4), 7, 3))
+
+    def test_stars_out_of_range_rejected(self):
+        self.assertIsNotNone(rating_block_reason(self._row(), 7, 0))
+        self.assertIsNotNone(rating_block_reason(self._row(), 7, 6))
+
+
+class TestTicketNotifySettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_valid_ticket_type(self):
+        for key in ("question", "report", "whitelist", "other"):
+            self.assertTrue(valid_ticket_type(key))
+        self.assertFalse(valid_ticket_type("unknown"))
+        self.assertFalse(valid_ticket_type(""))
+
+    def test_rating_enabled_default_on(self):
+        self.assertTrue(settings.get_ticket_rating_enabled(1))
+
+    def test_rating_enabled_round_trip_and_corrupt(self):
+        settings.set_value(1, settings.TICKET_RATING_ENABLED, False)
+        self.assertFalse(settings.get_ticket_rating_enabled(1))
+        # 壊れた値は既定 (有効) にフォールバック
+        settings.set_value(1, settings.TICKET_RATING_ENABLED, "off")
+        self.assertTrue(settings.get_ticket_rating_enabled(1))
+        # ギルドごとに独立
+        self.assertTrue(settings.get_ticket_rating_enabled(2))
+
+    def test_notify_roles_default_unset(self):
+        self.assertEqual(settings.get_ticket_notify_roles(1), {})
+        self.assertEqual(settings.get_ticket_notify_role(1, "question"), 0)
+
+    def test_notify_roles_round_trip_per_type(self):
+        settings.set_ticket_notify_role(1, "question", 111)
+        settings.set_ticket_notify_role(1, "whitelist", 222)
+        self.assertEqual(settings.get_ticket_notify_role(1, "question"), 111)
+        self.assertEqual(settings.get_ticket_notify_role(1, "whitelist"), 222)
+        self.assertEqual(settings.get_ticket_notify_role(1, "report"), 0)
+        self.assertEqual(
+            settings.get_ticket_notify_roles(1),
+            {"question": 111, "whitelist": 222},
+        )
+        # ギルドごとに独立
+        self.assertEqual(settings.get_ticket_notify_roles(2), {})
+
+    def test_notify_role_clear(self):
+        settings.set_ticket_notify_role(1, "question", 111)
+        settings.set_ticket_notify_role(1, "question", None)
+        self.assertEqual(settings.get_ticket_notify_role(1, "question"), 0)
+        settings.set_ticket_notify_role(1, "report", 333)
+        settings.set_ticket_notify_role(1, "report", 0)
+        self.assertEqual(settings.get_ticket_notify_roles(1), {})
+
+    def test_notify_roles_corrupt_fallback(self):
+        settings.set_value(1, settings.TICKET_NOTIFY_ROLES, "garbage")
+        self.assertEqual(settings.get_ticket_notify_roles(1), {})
+        # 数値化できないロール ID は落とされる
+        settings.set_value(
+            1, settings.TICKET_NOTIFY_ROLES, {"question": "abc", "report": "5"}
+        )
+        self.assertEqual(settings.get_ticket_notify_roles(1), {"report": 5})
+
+
+class TestTicketRatingButtonDynamicItem(unittest.TestCase):
+    def test_custom_id_and_template(self):
+        button = TicketRatingButton(42, 3)
+        self.assertEqual(button.custom_id, "v2:ticketrate:42:3")
+        self.assertEqual(button.ticket_id, 42)
+        self.assertEqual(button.stars, 3)
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:ticketrate:123:5")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["ticket_id"], "123")
+        self.assertEqual(match["stars"], "5")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:42"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:42"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:42:up"))
+        self.assertIsNone(button.template.fullmatch("v2:ticketrate:abc:3"))
+        self.assertIsNone(button.template.fullmatch("v2:ticketrate:42"))
 
 
 if __name__ == "__main__":
