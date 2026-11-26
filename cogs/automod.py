@@ -141,16 +141,18 @@ def find_invite(content):
 
 
 def content_violation(content, ngwords, mention_total, mention_limit,
-                      invites_enabled):
+                      invites_enabled, allow_invites=False):
     """本文ベースの違反判定。(理由キー, 詳細) か None を返す。
 
     スパム判定はバッファが要るので spam_reason 側で別に行う。
     詳細はログ表示用 (招待リンクはパターン名のみ、URL は含めない)。
+    allow_invites が True (宣伝許可チャンネル) の場合は招待リンクだけ
+    検知をスキップし、NGワードとメンションは通常どおり判定する。
     """
     word = find_ngword(content, ngwords)
     if word is not None:
         return "ngword", word
-    if invites_enabled:
+    if invites_enabled and not allow_invites:
         invite = find_invite(content)
         if invite is not None:
             return "invite", invite
@@ -201,12 +203,16 @@ class AutoModCog(commands.Cog):
         buffer[:] = [event for event in buffer if event[0] >= cutoff]
 
         mention_total = len(message.mentions) + len(message.role_mentions)
+        allow_invites = message.channel.id in (
+            settings.get_automod_ad_channel_ids(guild.id)
+        )
         violation = content_violation(
             content,
             settings.get_automod_ngwords(guild.id),
             mention_total,
             settings.get_automod_mention_limit(guild.id),
             settings.get_automod_invites_enabled(guild.id),
+            allow_invites=allow_invites,
         )
         if violation is None:
             reason = spam_reason(buffer, now)
@@ -392,6 +398,8 @@ class AutoModCog(commands.Cog):
             + (log_channel.mention if log_channel else "未設定"),
             "対象外チャンネル: "
             f"{len(settings.get_automod_exempt_channel_ids(gid))} 件",
+            "宣伝許可チャンネル: "
+            f"{len(settings.get_automod_ad_channel_ids(gid))} 件",
         ]
         await interaction.response.send_message(
             "\n".join(lines), ephemeral=True
@@ -466,7 +474,8 @@ class AutoModCog(commands.Cog):
         if not self._guard_admin_guild(interaction):
             await self._reject(interaction)
             return
-        words = settings.get_automod_ngwords(interaction.guild.id)
+        gid = interaction.guild.id
+        words = settings.get_automod_ngwords(gid)
         if not words:
             await interaction.response.send_message(
                 "NGワードは登録されていません。", ephemeral=True
@@ -474,6 +483,11 @@ class AutoModCog(commands.Cog):
             return
         lines = [f"登録中のNGワード（{len(words)} 件）:"]
         lines += [f"- {word}" for word in words]
+        if not settings.automod_ngwords_customized(gid):
+            lines.append(
+                "（デフォルトのセットを使用中です。追加・削除すると"
+                "この内容がこのサーバーのリストとして保存されます）"
+            )
         await interaction.response.send_message(
             "\n".join(lines), ephemeral=True
         )
@@ -566,6 +580,30 @@ class AutoModCog(commands.Cog):
             ids.append(channel.id)
             settings.set_value(gid, settings.AUTOMOD_EXEMPT_CHANNEL_IDS, ids)
             text = f"✅ {channel.mention} を自動モデレーションの**対象外にしました**。"
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @automod_group.command(
+        name="ad-channel",
+        description="チャンネルの宣伝（招待リンク）許可/不許可を切り替えます",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(channel="切り替えるチャンネル")
+    async def automod_ad_channel(
+        self, interaction: discord.Interaction, channel: discord.TextChannel
+    ):
+        if not self._guard_admin_guild(interaction):
+            await self._reject(interaction)
+            return
+        gid = interaction.guild.id
+        ids = settings.get_automod_ad_channel_ids(gid)
+        if channel.id in ids:
+            ids.remove(channel.id)
+            settings.set_value(gid, settings.AUTOMOD_AD_CHANNEL_IDS, ids)
+            text = f"✅ {channel.mention} の宣伝を**不許可に戻しました**（招待リンク検知が有効になります）。"
+        else:
+            ids.append(channel.id)
+            settings.set_value(gid, settings.AUTOMOD_AD_CHANNEL_IDS, ids)
+            text = f"✅ {channel.mention} を**宣伝許可チャンネルにしました**（招待リンクは検知されません。NGワード・スパム・メンション検知は有効なままです）。"
         await interaction.response.send_message(text, ephemeral=True)
 
     @automod_group.command(

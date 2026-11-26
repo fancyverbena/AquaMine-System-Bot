@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from app import settings  # noqa: E402
 from app.db import Database  # noqa: E402
 from app.ui import progress_bar, sanitize_channel_part  # noqa: E402
 from cogs.automod import (  # noqa: E402
@@ -408,6 +409,72 @@ class TestAutomodContentViolation(unittest.TestCase):
     def test_ngword_priority(self):
         result = content_violation("バカ discord.gg/abc", ["バカ"], 0, 5, True)
         self.assertEqual(result, ("ngword", "バカ"))
+
+
+class TestAutomodAdChannel(unittest.TestCase):
+    def test_invite_allowed_in_ad_channel(self):
+        # 宣伝許可チャンネルでは招待リンクだけ素通りする
+        self.assertIsNone(
+            content_violation(
+                "discord.gg/abc", [], 0, 5, True, allow_invites=True
+            )
+        )
+
+    def test_ngword_still_flagged_in_ad_channel(self):
+        result = content_violation(
+            "死ね discord.gg/abc",
+            settings.DEFAULT_NGWORDS,
+            0,
+            5,
+            True,
+            allow_invites=True,
+        )
+        self.assertEqual(result, ("ngword", "死ね"))
+
+    def test_mention_still_flagged_in_ad_channel(self):
+        result = content_violation(
+            "こんにちは", [], 5, 5, True, allow_invites=True
+        )
+        self.assertEqual(result[0], "mention")
+
+
+class TestAutomodNgwordDefaults(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_defaults_when_unset(self):
+        self.assertEqual(
+            settings.get_automod_ngwords(1), settings.DEFAULT_NGWORDS
+        )
+        self.assertFalse(settings.automod_ngwords_customized(1))
+
+    def test_default_words_match(self):
+        words = settings.get_automod_ngwords(1)
+        self.assertEqual(find_ngword("お前死ね", words), "死ね")
+        self.assertEqual(
+            find_ngword("FREE NITRO for everyone", words), "free nitro"
+        )
+        self.assertIsNone(find_ngword("今日はいい天気", words))
+
+    def test_defaults_returned_as_copy(self):
+        words = settings.get_automod_ngwords(1)
+        words.append("zzz")
+        self.assertNotIn("zzz", settings.DEFAULT_NGWORDS)
+
+    def test_custom_list_overrides_defaults(self):
+        settings.set_value(1, settings.AUTOMOD_NGWORDS, ["abc"])
+        self.assertEqual(settings.get_automod_ngwords(1), ["abc"])
+        self.assertTrue(settings.automod_ngwords_customized(1))
+
+    def test_empty_list_means_no_words(self):
+        settings.set_value(1, settings.AUTOMOD_NGWORDS, [])
+        self.assertEqual(settings.get_automod_ngwords(1), [])
 
 
 class TestInfractions(unittest.TestCase):
