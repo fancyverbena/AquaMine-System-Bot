@@ -15,6 +15,13 @@ XP_MIN = "xp_min"
 XP_MAX = "xp_max"
 XP_COOLDOWN_SECONDS = "xp_cooldown_seconds"
 XP_MIN_LENGTH = "xp_min_length"
+AUTOMOD_ENABLED = "automod_enabled"
+AUTOMOD_NGWORDS = "automod_ngwords"
+AUTOMOD_LOG_CHANNEL_ID = "automod_log_channel_id"
+AUTOMOD_MENTION_LIMIT = "automod_mention_limit"
+AUTOMOD_INVITES_ENABLED = "automod_invites_enabled"
+AUTOMOD_EXEMPT_CHANNEL_IDS = "automod_exempt_channel_ids"
+AUTOMOD_AD_CHANNEL_IDS = "automod_ad_channel_ids"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -27,6 +34,28 @@ DEFAULT_XP_MIN_LENGTH = 3
 XP_HARD_MAX = 10000
 COOLDOWN_HARD_MAX = 3600
 MIN_LENGTH_HARD_MAX = 200
+
+# 自動モデレーション設定のデフォルトと許容範囲
+DEFAULT_AUTOMOD_MENTION_LIMIT = 5
+MENTION_LIMIT_HARD_MAX = 50
+
+# NG ワードのデフォルトセット。ギルドが独自のリストを保存するまでは
+# これが使われる (追加・削除した時点で、その内容がギルドのリストとして
+# 保存される)。判定は正規化 (空白畳み込み+小文字化) 後の部分一致。
+DEFAULT_NGWORDS = [
+    "死ね",
+    "タヒ",
+    "fuck",
+    "bitch",
+    "nigger",
+    "nigga",
+    "faggot",
+    "free nitro",
+    "無料nitro",
+    "無料ニトロ",
+    "nitro無料",
+    "ニトロ無料",
+]
 
 # 表示名 (セットアップパネルのチェックリスト用)
 LABELS = {
@@ -81,6 +110,83 @@ def get_xp_config(guild_id: int) -> dict:
         "xp_cooldown_seconds": cooldown,
         "xp_min_length": min_length,
     }
+
+
+def get_automod_enabled(guild_id: int) -> bool:
+    """自動モデレーションの有効/無効 (既定は無効、壊れた値は無効扱い)。"""
+    value = get(guild_id, AUTOMOD_ENABLED, False)
+    return value if isinstance(value, bool) else False
+
+
+def get_automod_invites_enabled(guild_id: int) -> bool:
+    """招待リンク検知の有効/無効 (既定は有効、壊れた値は有効扱い)。"""
+    value = get(guild_id, AUTOMOD_INVITES_ENABLED, True)
+    return value if isinstance(value, bool) else True
+
+
+def get_automod_ngwords(guild_id: int) -> list:
+    """NG ワードの有効なリスト。
+
+    ギルドが独自リストを保存していればそれを (文字列でない要素は除外)、
+    未保存ならデフォルトセットのコピーを返す。空リストを保存すれば
+    NG ワードなしになる。
+    """
+    words = get(guild_id, AUTOMOD_NGWORDS, None)
+    if not isinstance(words, list):
+        return list(DEFAULT_NGWORDS)
+    return [w for w in words if isinstance(w, str)]
+
+
+def automod_ngwords_customized(guild_id: int) -> bool:
+    """ギルドが独自の NG ワードリストを保存済みかどうか。"""
+    return isinstance(get(guild_id, AUTOMOD_NGWORDS, None), list)
+
+
+def get_automod_log_channel_id(guild_id: int) -> int:
+    value = _get_int(guild_id, AUTOMOD_LOG_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_automod_mention_limit(guild_id: int) -> int:
+    """メンション乱用のしきい値 (0 で検知無効、範囲外はデフォルト)。"""
+    value = _get_int(
+        guild_id, AUTOMOD_MENTION_LIMIT, DEFAULT_AUTOMOD_MENTION_LIMIT
+    )
+    if not (0 <= value <= MENTION_LIMIT_HARD_MAX):
+        return DEFAULT_AUTOMOD_MENTION_LIMIT
+    return value
+
+
+def get_automod_exempt_channel_ids(guild_id: int) -> list:
+    """自動モデレーション対象外チャンネルの ID リスト。"""
+    ids = get(guild_id, AUTOMOD_EXEMPT_CHANNEL_IDS, [])
+    if not isinstance(ids, list):
+        return []
+    result = []
+    for item in ids:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def get_automod_ad_channel_ids(guild_id: int) -> list:
+    """宣伝 (招待リンク) が許可されるチャンネルの ID リスト。
+
+    このリストのチャンネルでは招待リンク検知だけが無効になる
+    (NGワード・スパム・メンション検知は引き続き有効)。
+    """
+    ids = get(guild_id, AUTOMOD_AD_CHANNEL_IDS, [])
+    if not isinstance(ids, list):
+        return []
+    result = []
+    for item in ids:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def get_level_roles(guild_id: int) -> dict:
