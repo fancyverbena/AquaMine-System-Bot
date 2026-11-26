@@ -27,6 +27,8 @@ ROLE_PANEL_ROLE_IDS = "role_panel_role_ids"
 ROLE_PANEL_EXCLUSIVE = "role_panel_exclusive"
 SUGGESTION_CHANNEL_ID = "suggestion_channel_id"
 BUG_CHANNEL_ID = "bug_channel_id"
+BUMP_REMINDER_ENABLED = "bump_reminder_enabled"
+BUMP_NOTIFY_ROLE_ID = "bump_notify_role_id"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -230,6 +232,21 @@ def get_suggestion_channel_id(guild_id: int) -> int:
 def get_bug_channel_id(guild_id: int) -> int:
     """バグ報告の投稿先チャンネル ID (0 は未設定)。"""
     value = _get_int(guild_id, BUG_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_bump_reminder_enabled(guild_id: int) -> bool:
+    """Bump リマインダーの有効/無効 (既定は有効、壊れた値は有効扱い)。
+
+    検知は受動的で、bump の成功メッセージを見たときだけ予約する。
+    """
+    value = get(guild_id, BUMP_REMINDER_ENABLED, True)
+    return value if isinstance(value, bool) else True
+
+
+def get_bump_notify_role_id(guild_id: int) -> int:
+    """Bump リマインダーでメンションするロール ID (0 は未設定)。"""
+    value = _get_int(guild_id, BUMP_NOTIFY_ROLE_ID, 0)
     return value if value > 0 else 0
 
 

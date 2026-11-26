@@ -12,6 +12,7 @@
   feedback(id, guild_id, kind, author_id, title, content,
            channel_id, message_id, status, created_at)
   feedback_votes(feedback_id, user_id, vote)
+  bump_reminders(guild_id, channel_id, bumper_id, remind_at)
 
 すべてのアクセスは context manager 経由で行い、接続を漏らさない。
 """
@@ -106,6 +107,12 @@ class Database:
                         user_id INTEGER NOT NULL,
                         vote INTEGER NOT NULL,
                         PRIMARY KEY (feedback_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS bump_reminders (
+                        guild_id INTEGER PRIMARY KEY,
+                        channel_id INTEGER NOT NULL,
+                        bumper_id INTEGER,
+                        remind_at REAL NOT NULL
                     );
                     CREATE TABLE IF NOT EXISTS tickets (
                         channel_id INTEGER PRIMARY KEY,
@@ -751,6 +758,60 @@ class Database:
         """(賛成数, 反対数) を返す。"""
         with self._conn() as conn:
             return self._count_votes(conn, feedback_id)
+
+    # ---------- bump_reminders (DISBOARD の Bump リマインダー) ----------
+
+    def set_bump_reminder(
+        self, guild_id: int, channel_id: int, bumper_id, remind_at: float
+    ):
+        """ギルドの Bump リマインダーを予約する (既存があれば上書き)。
+
+        1ギルドにつき予約は1件だけ。新しく bump されたら予約し直す。
+        bumper_id は bump した人の ID (不明なら None)。
+        """
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO bump_reminders (
+                    guild_id, channel_id, bumper_id, remind_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id) DO UPDATE SET
+                    channel_id = excluded.channel_id,
+                    bumper_id = excluded.bumper_id,
+                    remind_at = excluded.remind_at
+                """,
+                (guild_id, channel_id, bumper_id, remind_at),
+            )
+
+    def get_bump_reminder(self, guild_id: int):
+        """ギルドの予約中リマインダーを dict で返す。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM bump_reminders WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_due_bump_reminders(self, now: float):
+        """通知時刻 (remind_at) を過ぎた予約をすべて返す (再起動後の回収用)。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM bump_reminders
+                WHERE remind_at <= ?
+                ORDER BY remind_at ASC, guild_id ASC
+                """,
+                (now,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def clear_bump_reminder(self, guild_id: int):
+        """ギルドの予約中リマインダーを消す。"""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM bump_reminders WHERE guild_id = ?",
+                (guild_id,),
+            )
 
 
 def next_vote(current, clicked):
