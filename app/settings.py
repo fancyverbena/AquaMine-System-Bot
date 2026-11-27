@@ -29,6 +29,9 @@ SUGGESTION_CHANNEL_ID = "suggestion_channel_id"
 BUG_CHANNEL_ID = "bug_channel_id"
 BUMP_REMINDER_ENABLED = "bump_reminder_enabled"
 BUMP_NOTIFY_ROLE_ID = "bump_notify_role_id"
+BACKUP_CHANNEL_ID = "backup_channel_id"
+BACKUP_INTERVAL_HOURS = "backup_interval_hours"
+BACKUP_LAST_AT = "backup_last_at"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -50,6 +53,10 @@ MENTION_LIMIT_HARD_MAX = 50
 
 # ロールパネルの上限 (ボタンの並び順 = リストの順序)
 MAX_ROLE_PANEL_ROLES = 20
+
+# DB 自動バックアップのデフォルトと許容範囲 (間隔は時間単位、0 で自動投稿オフ)
+DEFAULT_BACKUP_INTERVAL_HOURS = 24
+BACKUP_INTERVAL_HARD_MAX = 168
 
 # NG ワードのデフォルトセット。ギルドが独自のリストを保存するまでは
 # これが使われる (追加・削除した時点で、その内容がギルドのリストとして
@@ -248,6 +255,30 @@ def get_bump_notify_role_id(guild_id: int) -> int:
     """Bump リマインダーでメンションするロール ID (0 は未設定)。"""
     value = _get_int(guild_id, BUMP_NOTIFY_ROLE_ID, 0)
     return value if value > 0 else 0
+
+
+def get_backup_channel_id(guild_id: int) -> int:
+    """DB バックアップの投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, BACKUP_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_backup_interval_hours(guild_id: int) -> int:
+    """自動バックアップの間隔 (時間)。0 で自動投稿オフ、範囲外はデフォルト。"""
+    value = _get_int(
+        guild_id, BACKUP_INTERVAL_HOURS, DEFAULT_BACKUP_INTERVAL_HOURS
+    )
+    if not (0 <= value <= BACKUP_INTERVAL_HARD_MAX):
+        return DEFAULT_BACKUP_INTERVAL_HOURS
+    return value
+
+
+def get_backup_last_at(guild_id: int) -> float:
+    """最後に自動/手動バックアップを投稿先へ送った時刻 (未実施は 0)。"""
+    try:
+        return float(get(guild_id, BACKUP_LAST_AT, 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:
