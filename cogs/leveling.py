@@ -4,9 +4,12 @@ XP は発言ごとに付与される。入手量・クールダウン・最小�
 (/level config で変更可能、DB の guild_settings に保存)。
 スパム対策として、テキストなし・短すぎる発言・直前と同一内容の連投には
 XP を付与しない (判定は xp_block_reason に集約)。
-また、ボイスチャンネル (VC) 滞在でも 1分ごとに XP が付与される
-(条件は vc_eligible、レートはギルド設定 vc_xp_per_minute、0 で無効)。
-レベル L に必要な累計 XP は 0 (L=0) または 5*L^2 + 50*L + 100。
+また、ボイスチャンネル (VC) 滞在でも 1分ごとに XP が付与されるが、
+こちらは発言とは別の VC レベルとして貯まる (レベルロールの設定も
+発言とは別に持つ。条件は vc_eligible、レートはギルド設定
+vc_xp_per_minute、0 で無効)。
+レベル L に必要な累計 XP は 0 (L=0) または 5*L^2 + 50*L + 100
+(発言・VC 両トラック共通)。
 """
 import asyncio
 import hashlib
@@ -49,6 +52,25 @@ def level_progress(total_xp: int):
     span = nxt - current
     fraction = (total_xp - current) / span if span > 0 else 0.0
     return level, fraction, nxt - total_xp
+
+
+def roles_for_level(level_roles: dict, new_level: int):
+    """レベル到達で付与すべき (対象レベル, ロール ID) を対象レベル昇順で返す純粋関数。
+
+    level_roles は {レベル文字列: ロール ID 文字列} の設定。
+    new_level 以下に設定されたロールが対象で、数値化できない
+    エントリは無視する。発言・VC 両トラックで共用する。
+    """
+    result = []
+    for level_str, role_id_str in (level_roles or {}).items():
+        try:
+            role_level = int(level_str)
+            role_id = int(role_id_str)
+        except (TypeError, ValueError):
+            continue
+        if role_level <= new_level:
+            result.append((role_level, role_id))
+    return sorted(result)
 
 
 def normalize_content(content) -> str:
@@ -246,7 +268,7 @@ class LevelingCog(commands.Cog):
     def cog_unload(self):
         self.vc_xp_loop.cancel()
 
-    # ---------- XP 付与 (共通) ----------
+    # ---------- XP 付与 (発言トラック) ----------
 
     async def grant_xp(
         self,
@@ -258,12 +280,12 @@ class LevelingCog(commands.Cog):
         recent_content_hashes=None,
         announce_channel: discord.TextChannel = None,
     ):
-        """XP を amount だけ加算する共通処理 (発言・VC の両経路で使う)。
+        """発言トラックの XP を amount だけ加算する。
 
         last_message_time / recent_content_hashes を省略すると DB の現在値を
-        そのまま引き継ぐ (VC 付与で発言側のクールダウンや重複履歴を壊さない)。
-        レベルアップしたらレベルロールを付与し、announce_channel
-        (未指定ならレベル通知チャンネル) へ通知する。
+        そのまま引き継ぐ。レベルアップしたらレベルロールを付与し、
+        announce_channel (未指定ならレベル通知チャンネル) へ通知する。
+        VC 滞在の付与は grant_vc_xp (VC トラックは別管理)。
         """
         data = db.get_xp(member.id, guild.id, create=True)
         new_xp = data["xp"] + amount
@@ -285,6 +307,26 @@ class LevelingCog(commands.Cog):
         )
         if new_level > old_level:
             await self._on_level_up(guild, member, new_level, announce_channel)
+
+    async def grant_vc_xp(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        amount: int,
+    ):
+        """VC トラックの XP を amount だけ加算する。
+
+        発言側の xp / level / クールダウン / 重複履歴には一切触れない。
+        VC レベルが上がったら VC 側のレベルロールを付与し、
+        レベル通知チャンネル (設定時) へ通知する。
+        """
+        data = db.get_xp(member.id, guild.id, create=True)
+        new_vc_xp = data["vc_xp"] + amount
+        old_vc_level = data["vc_level"]
+        new_vc_level = calc_level(new_vc_xp)
+        db.upsert_vc_xp(member.id, guild.id, new_vc_xp, new_vc_level)
+        if new_vc_level > old_vc_level:
+            await self._on_vc_level_up(guild, member, new_vc_level)
 
     # ---------- XP 付与 (発言) ----------
 
@@ -324,22 +366,18 @@ class LevelingCog(commands.Cog):
             announce_channel=message.channel,
         )
 
-    async def _on_level_up(
+    async def _grant_level_roles(
         self,
         guild: discord.Guild,
         member: discord.Member,
+        level_roles: dict,
         new_level: int,
-        fallback_channel: discord.TextChannel = None,
     ):
-        level_roles = settings.get_level_roles(guild.id)
-        for level_str, role_id_str in level_roles.items():
-            try:
-                role_level = int(level_str)
-                role_id = int(role_id_str)
-            except (TypeError, ValueError):
-                continue
-            if new_level < role_level:
-                continue
+        """到達レベル以下の設定ロールをすべて付与する (発言・VC 共通)。
+
+        すでに持っているロールと、削除済みのロールはスキップする。
+        """
+        for role_level, role_id in roles_for_level(level_roles, new_level):
             role = guild.get_role(role_id)
             if role is None or role in member.roles:
                 continue
@@ -351,6 +389,17 @@ class LevelingCog(commands.Cog):
                 print(f"⚠️ ロール {role.name} を付与する権限がありません。")
             except discord.HTTPException as e:
                 print(f"⚠️ レベルロール付与エラー: {e}")
+
+    async def _on_level_up(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        new_level: int,
+        fallback_channel: discord.TextChannel = None,
+    ):
+        await self._grant_level_roles(
+            guild, member, settings.get_level_roles(guild.id), new_level
+        )
 
         embed = discord.Embed(
             title="🎉 レベルアップ！",
@@ -364,11 +413,43 @@ class LevelingCog(commands.Cog):
             if isinstance(channel, discord.TextChannel):
                 target = channel
         if target is None:
-            # 通知先がない (VC 付与でレベル通知チャンネル未設定) 場合は
-            # ロール付与だけ行って通知はしない
+            # 通知先がない場合はロール付与だけ行って通知はしない
             return
         try:
             await target.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    async def _on_vc_level_up(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        new_level: int,
+    ):
+        """VC レベルアップ時の処理: VC 側のレベルロール付与と通知。
+
+        通知先はレベル通知チャンネル (発言と共通) のみで、未設定の
+        場合はロール付与だけ行って通知はしない。
+        """
+        await self._grant_level_roles(
+            guild, member, settings.get_vc_level_roles(guild.id), new_level
+        )
+
+        levelup_id = settings.get(guild.id, settings.LEVELUP_CHANNEL_ID)
+        if not levelup_id:
+            return
+        channel = guild.get_channel(int(levelup_id))
+        if not isinstance(channel, discord.TextChannel):
+            return
+        embed = discord.Embed(
+            title="🎉 VCレベルアップ！",
+            description=(
+                f"{member.mention} が **VCレベル {new_level}** に上がりました！"
+            ),
+            color=COLOR_GOLD,
+        )
+        try:
+            await channel.send(embed=embed)
         except discord.HTTPException:
             pass
 
@@ -462,7 +543,7 @@ class LevelingCog(commands.Cog):
         for guild_id, user_id in grants:
             guild, member, rate = eligible[(guild_id, user_id)]
             try:
-                await self.grant_xp(guild, member, rate)
+                await self.grant_vc_xp(guild, member, rate)
             except Exception as error:  # 1人の失敗でループ自体を止めない
                 print(f"⚠️ VC XP 付与に失敗 ({user_id}@{guild_id}): {error}")
 
@@ -486,17 +567,26 @@ class LevelingCog(commands.Cog):
         xp = data["xp"]
         level, fraction, remaining = level_progress(xp)
         rank = db.get_rank(user.id, guild.id)
+        vc_xp = data["vc_xp"]
+        vc_level, vc_fraction, vc_remaining = level_progress(vc_xp)
 
         embed = discord.Embed(
             title=f"📊 {user.display_name} のランク",
             color=COLOR_PRIMARY,
         )
         embed.add_field(name="ランキング", value=f"#{rank}", inline=True)
-        embed.add_field(name="レベル", value=f"Lv.{level}", inline=True)
+        embed.add_field(name="発言レベル", value=f"Lv.{level}", inline=True)
         embed.add_field(name="総XP", value=f"{xp} XP", inline=True)
         embed.add_field(
             name=f"次のレベルまで（あと {remaining} XP）",
             value=f"{progress_bar(fraction)} {int(fraction * 100)}%",
+            inline=False,
+        )
+        embed.add_field(name="VCレベル", value=f"Lv.{vc_level}", inline=True)
+        embed.add_field(name="VC総XP", value=f"{vc_xp} XP", inline=True)
+        embed.add_field(
+            name=f"次のVCレベルまで（あと {vc_remaining} XP）",
+            value=f"{progress_bar(vc_fraction)} {int(vc_fraction * 100)}%",
             inline=False,
         )
         cooldown = settings.get_xp_config(guild.id)["xp_cooldown_seconds"]
@@ -628,9 +718,24 @@ class LevelingCog(commands.Cog):
 
     @level_group.command(name="set-role", description="レベル到達時に付与するロールを設定します")
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(level="対象レベル（1以上）", role="付与するロール")
+    @app_commands.describe(
+        level="対象レベル（1以上）",
+        role="付与するロール",
+        track="種別（省略時は発言）",
+    )
+    @app_commands.rename(track="種別")
+    @app_commands.choices(
+        track=[
+            app_commands.Choice(name="発言", value="text"),
+            app_commands.Choice(name="VC", value="vc"),
+        ]
+    )
     async def level_set_role(
-        self, interaction: discord.Interaction, level: int, role: discord.Role
+        self,
+        interaction: discord.Interaction,
+        level: int,
+        role: discord.Role,
+        track: str = "text",
     ):
         if not self._guard_admin_guild(interaction):
             await self._reject(interaction)
@@ -638,28 +743,48 @@ class LevelingCog(commands.Cog):
         if level < 1:
             await reply_error(interaction, "レベルは1以上を指定してください。")
             return
-        settings.set_level_role(interaction.guild.id, level, role.id)
+        if track == "vc":
+            settings.set_vc_level_role(interaction.guild.id, level, role.id)
+            label = "VCレベル"
+        else:
+            settings.set_level_role(interaction.guild.id, level, role.id)
+            label = "発言レベル"
         await interaction.response.send_message(
-            f"✅ レベル **{level}** 到達時に {role.mention} を付与するよう設定しました。",
+            f"✅ {label} **{level}** 到達時に {role.mention} を付与するよう設定しました。",
             ephemeral=True,
         )
 
     @level_group.command(name="remove-role", description="レベルロールの設定を解除します")
     @app_commands.checks.has_permissions(administrator=True)
-    @app_commands.describe(level="解除するレベル")
+    @app_commands.describe(level="解除するレベル", track="種別（省略時は発言）")
+    @app_commands.rename(track="種別")
+    @app_commands.choices(
+        track=[
+            app_commands.Choice(name="発言", value="text"),
+            app_commands.Choice(name="VC", value="vc"),
+        ]
+    )
     async def level_remove_role(
-        self, interaction: discord.Interaction, level: int
+        self, interaction: discord.Interaction, level: int, track: str = "text"
     ):
         if not self._guard_admin_guild(interaction):
             await self._reject(interaction)
             return
-        if settings.remove_level_role(interaction.guild.id, level):
+        if track == "vc":
+            removed = settings.remove_vc_level_role(interaction.guild.id, level)
+            label = "VCレベル"
+        else:
+            removed = settings.remove_level_role(interaction.guild.id, level)
+            label = "発言レベル"
+        if removed:
             await interaction.response.send_message(
-                f"✅ レベル **{level}** のロール設定を解除しました。",
+                f"✅ {label} **{level}** のロール設定を解除しました。",
                 ephemeral=True,
             )
         else:
-            await reply_error(interaction, f"レベル **{level}** の設定はありません。")
+            await reply_error(
+                interaction, f"{label} **{level}** の設定はありません。"
+            )
 
     @level_group.command(name="give-xp", description="メンバーのXPを増減します")
     @app_commands.checks.has_permissions(administrator=True)
@@ -776,9 +901,10 @@ class LevelingCog(commands.Cog):
         if not self._guard_admin_guild(interaction):
             await self._reject(interaction)
             return
+        # 行ごと消すため、発言・VC 両トラックがリセットされる
         db.delete_xp(member.id, interaction.guild.id)
         await interaction.response.send_message(
-            f"✅ {member.mention} のXPとレベルをリセットしました。",
+            f"✅ {member.mention} のXPとレベルをリセットしました（発言・VC両方）。",
             ephemeral=True,
         )
 

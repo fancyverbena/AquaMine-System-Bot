@@ -48,7 +48,7 @@ class HelpCog(commands.Cog):
                 value=(
                     "**/setup**: 設定パネル（ロール/チャンネルの選択、パネル設置、自動クローズ設定）。\n"
                     "**/settings**: 現在の設定の一覧。\n"
-                    "**/level set-role / remove-role**: レベル到達で付与するロール。\n"
+                    "**/level set-role / remove-role**: レベル到達で付与するロール（種別で発言/VCを個別に設定）。\n"
                     "**/level give-xp / reset**: メンバーのXP調整とリセット。"
                 ),
                 inline=False,

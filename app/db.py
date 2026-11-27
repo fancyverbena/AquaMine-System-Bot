@@ -2,7 +2,10 @@
 
 テーブル:
   guild_settings(guild_id, key, value)  -- value は JSON 文字列
-  user_xp(user_id, guild_id, xp, level, last_message_time, recent_content_hashes)
+  user_xp(user_id, guild_id, xp, level, last_message_time, recent_content_hashes,
+          vc_xp, vc_level)
+          -- xp/level は発言トラック、vc_xp/vc_level は VC トラック。
+             2つのトラックは独立に加算され、互いに干渉しない
   xp_weekly_baseline(guild_id, user_id, xp)
           -- 週間ランキング用。週の開始時点の累計 XP スナップショットで、
              現在の累計との差分が「その週に増えた XP」になる
@@ -73,6 +76,8 @@ class Database:
                         level INTEGER NOT NULL DEFAULT 0,
                         last_message_time REAL NOT NULL DEFAULT 0,
                         recent_content_hashes TEXT,
+                        vc_xp INTEGER NOT NULL DEFAULT 0,
+                        vc_level INTEGER NOT NULL DEFAULT 0,
                         PRIMARY KEY (user_id, guild_id)
                     );
                     CREATE TABLE IF NOT EXISTS infractions (
@@ -180,6 +185,15 @@ class Database:
             conn.execute(
                 "ALTER TABLE user_xp ADD COLUMN recent_content_hashes TEXT"
             )
+        if columns and "vc_xp" not in columns:
+            conn.execute(
+                "ALTER TABLE user_xp ADD COLUMN vc_xp INTEGER NOT NULL DEFAULT 0"
+            )
+        if columns and "vc_level" not in columns:
+            conn.execute(
+                "ALTER TABLE user_xp"
+                " ADD COLUMN vc_level INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ---------- guild_settings ----------
 
@@ -223,11 +237,17 @@ class Database:
         return [str(h) for h in value]
 
     def get_xp(self, user_id: int, guild_id: int, create: bool = False) -> dict:
-        """ユーザーの XP 行を返す。create=False の読み取りでは行を作らない。"""
+        """ユーザーの XP 行を返す。create=False の読み取りでは行を作らない。
+
+        戻り値には発言トラック (xp / level) と VC トラック (vc_xp /
+        vc_level) の両方を含む。読み取り専用なので、どちらのトラックも
+        変更しない。
+        """
         with self._conn() as conn:
             row = conn.execute(
                 """
-                SELECT xp, level, last_message_time, recent_content_hashes
+                SELECT xp, level, vc_xp, vc_level,
+                       last_message_time, recent_content_hashes
                 FROM user_xp
                 WHERE user_id = ? AND guild_id = ?
                 """,
@@ -244,6 +264,8 @@ class Database:
                 return {
                     "xp": 0,
                     "level": 0,
+                    "vc_xp": 0,
+                    "vc_level": 0,
                     "last_message_time": 0,
                     "recent_content_hashes": [],
                 }
@@ -251,12 +273,16 @@ class Database:
             return {
                 "xp": 0,
                 "level": 0,
+                "vc_xp": 0,
+                "vc_level": 0,
                 "last_message_time": 0,
                 "recent_content_hashes": [],
             }
         return {
             "xp": row["xp"],
             "level": row["level"],
+            "vc_xp": row["vc_xp"],
+            "vc_level": row["vc_level"],
             "last_message_time": row["last_message_time"],
             "recent_content_hashes": self._parse_hashes(
                 row["recent_content_hashes"]
@@ -299,6 +325,24 @@ class Database:
                     last_message_time,
                     hashes_json,
                 ),
+            )
+
+    def upsert_vc_xp(self, user_id: int, guild_id: int, vc_xp: int, vc_level: int):
+        """VC トラックの XP/レベルだけを書き込む。
+
+        発言側の xp / level / last_message_time / recent_content_hashes
+        には一切触れない (行が無ければ、発言側はすべて 0 の行を作る)。
+        """
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_xp (user_id, guild_id, vc_xp, vc_level)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, guild_id) DO UPDATE SET
+                    vc_xp = excluded.vc_xp,
+                    vc_level = excluded.vc_level
+                """,
+                (user_id, guild_id, vc_xp, vc_level),
             )
 
     def delete_xp(self, user_id: int, guild_id: int):

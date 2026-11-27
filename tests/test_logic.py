@@ -33,6 +33,7 @@ from cogs.leveling import (  # noqa: E402
     level_progress,
     next_recent_hashes,
     normalize_content,
+    roles_for_level,
     validate_xp_config,
     vc_eligible,
     xp_block_reason,
@@ -1049,6 +1050,158 @@ class TestVcXpConfigValidation(unittest.TestCase):
     def test_vc_field_invalid(self):
         self.assertIsNotNone(validate_xp_config(10, 25, 30, 3, -1))
         self.assertIsNotNone(validate_xp_config(10, 25, 30, 3, 1001))
+
+
+class TestVcLevelRolesSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_round_trip(self):
+        self.assertEqual(settings.get_vc_level_roles(1), {})
+        settings.set_vc_level_role(1, 10, 555)
+        self.assertEqual(settings.get_vc_level_roles(1), {"10": "555"})
+        settings.set_vc_level_role(1, 20, 777)
+        self.assertEqual(
+            settings.get_vc_level_roles(1), {"10": "555", "20": "777"}
+        )
+        # 同じレベルは上書きできる
+        settings.set_vc_level_role(1, 10, 999)
+        self.assertEqual(settings.get_vc_level_roles(1)["10"], "999")
+        # 解除 (無いレベルは False)
+        self.assertTrue(settings.remove_vc_level_role(1, 10))
+        self.assertFalse(settings.remove_vc_level_role(1, 10))
+        self.assertEqual(settings.get_vc_level_roles(1), {"20": "777"})
+        # ギルドごとに独立
+        self.assertEqual(settings.get_vc_level_roles(2), {})
+
+    def test_independent_from_text_level_roles(self):
+        settings.set_level_role(1, 10, 111)
+        settings.set_vc_level_role(1, 10, 222)
+        self.assertEqual(settings.get_level_roles(1), {"10": "111"})
+        self.assertEqual(settings.get_vc_level_roles(1), {"10": "222"})
+        # VC 側を解除しても発言側は残る
+        self.assertTrue(settings.remove_vc_level_role(1, 10))
+        self.assertEqual(settings.get_level_roles(1), {"10": "111"})
+
+
+class TestVcTrackSeparation(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_vc_defaults_are_zero(self):
+        data = self.db.get_xp(1, 100)
+        self.assertEqual(data["vc_xp"], 0)
+        self.assertEqual(data["vc_level"], 0)
+
+    def test_text_write_does_not_touch_vc(self):
+        self.db.upsert_vc_xp(1, 100, 300, 2)
+        self.db.upsert_xp(1, 100, 500, 4, 1.0, recent_content_hashes=["a"])
+        data = self.db.get_xp(1, 100)
+        self.assertEqual(data["xp"], 500)
+        self.assertEqual(data["level"], 4)
+        self.assertEqual(data["vc_xp"], 300)
+        self.assertEqual(data["vc_level"], 2)
+
+    def test_vc_write_does_not_touch_text(self):
+        self.db.upsert_xp(1, 100, 500, 4, 1.5, recent_content_hashes=["x"])
+        self.db.upsert_vc_xp(1, 100, 800, 5)
+        data = self.db.get_xp(1, 100)
+        self.assertEqual(data["xp"], 500)
+        self.assertEqual(data["level"], 4)
+        self.assertEqual(data["last_message_time"], 1.5)
+        self.assertEqual(data["recent_content_hashes"], ["x"])
+        self.assertEqual(data["vc_xp"], 800)
+        self.assertEqual(data["vc_level"], 5)
+
+    def test_vc_write_creates_row_with_text_zero(self):
+        self.db.upsert_vc_xp(9, 100, 120, 1)
+        data = self.db.get_xp(9, 100)
+        self.assertEqual(data["xp"], 0)
+        self.assertEqual(data["level"], 0)
+        self.assertEqual(data["vc_xp"], 120)
+        self.assertEqual(data["vc_level"], 1)
+
+    def test_vc_columns_migration(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.db")
+            conn = sqlite3.connect(path)
+            with conn:
+                # vc 列のない user_xp (発言側の値だけ入っている)
+                conn.execute(
+                    """
+                    CREATE TABLE user_xp (
+                        user_id INTEGER NOT NULL,
+                        guild_id INTEGER NOT NULL,
+                        xp INTEGER NOT NULL DEFAULT 0,
+                        level INTEGER NOT NULL DEFAULT 0,
+                        last_message_time REAL NOT NULL DEFAULT 0,
+                        recent_content_hashes TEXT,
+                        PRIMARY KEY (user_id, guild_id)
+                    )
+                    """
+                )
+                conn.execute(
+                    "INSERT INTO user_xp VALUES (7, 100, 500, 4, 1.5, NULL)"
+                )
+            conn.close()
+
+            db = Database(path)
+
+            conn = sqlite3.connect(path)
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(user_xp)")
+            ]
+            conn.close()
+            self.assertIn("vc_xp", columns)
+            self.assertIn("vc_level", columns)
+
+            # 既存の発言側は保持され、VC 側は 0 から始まる
+            data = db.get_xp(7, 100)
+            self.assertEqual(data["xp"], 500)
+            self.assertEqual(data["level"], 4)
+            self.assertEqual(data["vc_xp"], 0)
+            self.assertEqual(data["vc_level"], 0)
+
+            # VC 側を書いても発言側は変わらない
+            db.upsert_vc_xp(7, 100, 120, 1)
+            data = db.get_xp(7, 100)
+            self.assertEqual(data["xp"], 500)
+            self.assertEqual(data["vc_xp"], 120)
+
+
+class TestRolesForLevel(unittest.TestCase):
+    def test_selects_roles_at_or_below_level(self):
+        roles = {"5": "111", "10": "222", "20": "333"}
+        self.assertEqual(roles_for_level(roles, 4), [])
+        self.assertEqual(roles_for_level(roles, 5), [(5, 111)])
+        self.assertEqual(roles_for_level(roles, 10), [(5, 111), (10, 222)])
+        self.assertEqual(
+            roles_for_level(roles, 99), [(5, 111), (10, 222), (20, 333)]
+        )
+
+    def test_result_sorted_by_level(self):
+        roles = {"20": "333", "5": "111"}
+        self.assertEqual(roles_for_level(roles, 20), [(5, 111), (20, 333)])
+
+    def test_skips_invalid_entries(self):
+        roles = {"x": "111", "5": "abc", "7": "222"}
+        self.assertEqual(roles_for_level(roles, 10), [(7, 222)])
+
+    def test_empty(self):
+        self.assertEqual(roles_for_level({}, 10), [])
+        self.assertEqual(roles_for_level(None, 10), [])
 
 
 class TestGiveawayButtonDynamicItem(unittest.TestCase):
