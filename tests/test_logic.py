@@ -33,6 +33,11 @@ from cogs.leveling import (  # noqa: E402
     xp_block_reason,
     xp_threshold,
 )
+from cogs.bump import (  # noqa: E402
+    DISBOARD_BOT_ID,
+    extract_bumper_id,
+    is_bump_success,
+)
 from cogs.feedback import (  # noqa: E402
     FeedbackStatusButton,
     FeedbackVoteButton,
@@ -1225,6 +1230,153 @@ class TestFeedbackButtonsDynamicItem(unittest.TestCase):
         self.assertIsNone(button.template.fullmatch("v2:giveaway:42"))
         self.assertIsNone(button.template.fullmatch("v2:fbvote:42:up"))
         self.assertIsNone(button.template.fullmatch("v2:fbstatus:abc:fixed"))
+
+
+class TestBumpDetection(unittest.TestCase):
+    def test_disboard_japanese_marker(self):
+        self.assertTrue(
+            is_bump_success(
+                DISBOARD_BOT_ID, ["サーバーの表示順をアップしました！"]
+            )
+        )
+        self.assertTrue(
+            is_bump_success(DISBOARD_BOT_ID, ["表示順をアップしたよ"])
+        )
+
+    def test_disboard_english_marker(self):
+        self.assertTrue(
+            is_bump_success(DISBOARD_BOT_ID, ["Bump done! :thumbsup:"])
+        )
+        self.assertTrue(
+            is_bump_success(DISBOARD_BOT_ID, ["<@7> bumped the server!"])
+        )
+
+    def test_disboard_unrelated_embed(self):
+        self.assertFalse(
+            is_bump_success(DISBOARD_BOT_ID, ["DISBOARD のお知らせです"])
+        )
+
+    def test_other_author_with_marker(self):
+        self.assertFalse(
+            is_bump_success(123456789, ["サーバーの表示順をアップしました"])
+        )
+        self.assertFalse(is_bump_success(123456789, ["Bump done!"]))
+
+    def test_no_embeds(self):
+        self.assertFalse(is_bump_success(DISBOARD_BOT_ID, []))
+        self.assertFalse(is_bump_success(DISBOARD_BOT_ID, None))
+        self.assertFalse(is_bump_success(DISBOARD_BOT_ID, [None, ""]))
+
+    def test_marker_in_any_embed(self):
+        descriptions = ["関係ない文", "サーバーの表示順をアップしました"]
+        self.assertTrue(is_bump_success(DISBOARD_BOT_ID, descriptions))
+
+
+class TestBumpExtractBumper(unittest.TestCase):
+    def test_mention_present(self):
+        self.assertEqual(
+            extract_bumper_id("<@123456> が表示順をアップしました"), 123456
+        )
+
+    def test_nickname_mention_present(self):
+        self.assertEqual(extract_bumper_id("<@!987654> bumped"), 987654)
+
+    def test_mention_absent(self):
+        self.assertIsNone(extract_bumper_id("表示順をアップしました"))
+        self.assertIsNone(extract_bumper_id(""))
+        self.assertIsNone(extract_bumper_id(None))
+
+
+class TestBumpReminderDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_set_get_round_trip(self):
+        self.db.set_bump_reminder(100, 555, 777, 2000.0)
+        row = self.db.get_bump_reminder(100)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["channel_id"], 555)
+        self.assertEqual(row["bumper_id"], 777)
+        self.assertEqual(row["remind_at"], 2000.0)
+        self.assertIsNone(self.db.get_bump_reminder(999))
+
+    def test_bumper_nullable(self):
+        self.db.set_bump_reminder(100, 555, None, 2000.0)
+        self.assertIsNone(self.db.get_bump_reminder(100)["bumper_id"])
+
+    def test_overwrite_resets_reminder(self):
+        self.db.set_bump_reminder(100, 555, 777, 2000.0)
+        self.db.set_bump_reminder(100, 666, 888, 5000.0)
+        row = self.db.get_bump_reminder(100)
+        self.assertEqual(row["channel_id"], 666)
+        self.assertEqual(row["bumper_id"], 888)
+        self.assertEqual(row["remind_at"], 5000.0)
+
+    def test_due_selection(self):
+        self.db.set_bump_reminder(100, 555, 777, 1500.0)  # 期限切れ
+        self.db.set_bump_reminder(200, 556, 778, 2500.0)  # まだ先
+        due = self.db.get_due_bump_reminders(2000.0)
+        self.assertEqual([r["guild_id"] for r in due], [100])
+        # 時刻ちょうども期限として扱う
+        due = self.db.get_due_bump_reminders(2500.0)
+        self.assertEqual([r["guild_id"] for r in due], [100, 200])
+
+    def test_clear(self):
+        self.db.set_bump_reminder(100, 555, 777, 1500.0)
+        self.db.clear_bump_reminder(100)
+        self.assertIsNone(self.db.get_bump_reminder(100))
+        self.assertEqual(self.db.get_due_bump_reminders(2000.0), [])
+
+    def test_per_guild_isolation(self):
+        self.db.set_bump_reminder(100, 555, 777, 1500.0)
+        self.db.set_bump_reminder(200, 556, 778, 1600.0)
+        self.db.clear_bump_reminder(100)
+        self.assertIsNone(self.db.get_bump_reminder(100))
+        self.assertEqual(self.db.get_bump_reminder(200)["channel_id"], 556)
+
+
+class TestBumpSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_enabled_default_true(self):
+        self.assertTrue(settings.get_bump_reminder_enabled(1))
+
+    def test_enabled_round_trip(self):
+        settings.set_value(1, settings.BUMP_REMINDER_ENABLED, False)
+        self.assertFalse(settings.get_bump_reminder_enabled(1))
+        settings.set_value(1, settings.BUMP_REMINDER_ENABLED, True)
+        self.assertTrue(settings.get_bump_reminder_enabled(1))
+        # ギルドごとに独立
+        self.assertTrue(settings.get_bump_reminder_enabled(2))
+
+    def test_enabled_corrupt_fallback_true(self):
+        settings.set_value(1, settings.BUMP_REMINDER_ENABLED, "abc")
+        self.assertTrue(settings.get_bump_reminder_enabled(1))
+
+    def test_notify_role_default_unset(self):
+        self.assertEqual(settings.get_bump_notify_role_id(1), 0)
+
+    def test_notify_role_round_trip(self):
+        settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, 424242)
+        self.assertEqual(settings.get_bump_notify_role_id(1), 424242)
+        self.assertEqual(settings.get_bump_notify_role_id(2), 0)
+
+    def test_notify_role_corrupt_fallback(self):
+        settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, "abc")
+        self.assertEqual(settings.get_bump_notify_role_id(1), 0)
+        settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, -5)
+        self.assertEqual(settings.get_bump_notify_role_id(1), 0)
 
 
 if __name__ == "__main__":
