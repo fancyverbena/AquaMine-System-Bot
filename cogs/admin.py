@@ -405,6 +405,18 @@ class AdminCog(commands.Cog):
         else:
             embed.add_field(name="レベルロール", value="未設定", inline=False)
 
+        vc_level_roles = settings.get_vc_level_roles(gid)
+        if vc_level_roles:
+            lines = []
+            for level_str in sorted(vc_level_roles, key=lambda s: int(s)):
+                role = guild.get_role(int(vc_level_roles[level_str]))
+                lines.append(
+                    f"Lv.{level_str}: {role.mention if role else '(削除済みロール)'}"
+                )
+            embed.add_field(
+                name="VCレベルロール", value="\n".join(lines), inline=False
+            )
+
         embed.color = COLOR_PRIMARY if level_roles else COLOR_WARN
         await interaction.response.send_message(embed=embed, ephemeral=True)
 

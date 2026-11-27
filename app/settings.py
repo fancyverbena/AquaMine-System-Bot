@@ -11,6 +11,7 @@ LOG_CHANNEL_ID = "log_channel_id"
 LEVELUP_CHANNEL_ID = "levelup_channel_id"
 AUTO_CLOSE_HOURS = "auto_close_hours"
 LEVEL_ROLES = "level_roles"
+VC_LEVEL_ROLES = "vc_level_roles"
 XP_MIN = "xp_min"
 XP_MAX = "xp_max"
 XP_COOLDOWN_SECONDS = "xp_cooldown_seconds"
@@ -467,4 +468,28 @@ def remove_level_role(guild_id: int, level: int) -> bool:
         return False
     del roles[str(level)]
     set_value(guild_id, LEVEL_ROLES, roles)
+    return True
+
+
+def get_vc_level_roles(guild_id: int) -> dict:
+    """VC レベルの到達ロール設定 {レベル文字列: ロール ID 文字列}。
+
+    発言側の level_roles とは独立に保持される。
+    """
+    roles = get(guild_id, VC_LEVEL_ROLES, {})
+    return roles if isinstance(roles, dict) else {}
+
+
+def set_vc_level_role(guild_id: int, level: int, role_id: int):
+    roles = get_vc_level_roles(guild_id)
+    roles[str(level)] = str(role_id)
+    set_value(guild_id, VC_LEVEL_ROLES, roles)
+
+
+def remove_vc_level_role(guild_id: int, level: int) -> bool:
+    roles = get_vc_level_roles(guild_id)
+    if str(level) not in roles:
+        return False
+    del roles[str(level)]
+    set_value(guild_id, VC_LEVEL_ROLES, roles)
     return True
