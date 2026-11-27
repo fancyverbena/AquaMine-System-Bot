@@ -34,6 +34,13 @@ BACKUP_INTERVAL_HOURS = "backup_interval_hours"
 BACKUP_LAST_AT = "backup_last_at"
 TICKET_RATING_ENABLED = "ticket_rating_enabled"
 TICKET_NOTIFY_ROLES = "ticket_notify_roles"
+WELCOME_CHANNEL_ID = "welcome_channel_id"
+WELCOME_MESSAGE = "welcome_message"
+WELCOME_DM_ENABLED = "welcome_dm_enabled"
+AUDIT_LOG_CHANNEL_ID = "audit_log_channel_id"
+AUDIT_MESSAGE_DELETE = "audit_message_delete"
+AUDIT_MESSAGE_EDIT = "audit_message_edit"
+AUDIT_VOICE = "audit_voice"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -325,6 +332,53 @@ def set_ticket_notify_role(guild_id: int, ticket_type: str, role_id):
     else:
         roles.pop(ticket_type, None)
     set_value(guild_id, TICKET_NOTIFY_ROLES, roles)
+
+
+def get_welcome_channel_id(guild_id: int) -> int:
+    """ウェルカムメッセージの投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, WELCOME_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_welcome_message(guild_id: int) -> str:
+    """ウェルカムメッセージの文面テンプレート (未設定・壊れた値は空文字)。
+
+    空文字は「デフォルト文面を使う」という意味で、実際の文面への
+    解決は cogs.serverlog の effective_welcome_template が行う。
+    使えるプレースホルダは {member} {name} {server} {count}。
+    """
+    value = get(guild_id, WELCOME_MESSAGE, "")
+    return value if isinstance(value, str) else ""
+
+
+def get_welcome_dm_enabled(guild_id: int) -> bool:
+    """参加時にウェルカムメッセージを DM でも送るか (既定は無効)。"""
+    value = get(guild_id, WELCOME_DM_ENABLED, False)
+    return value if isinstance(value, bool) else False
+
+
+def get_audit_log_channel_id(guild_id: int) -> int:
+    """監査ログの投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, AUDIT_LOG_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_audit_message_delete_enabled(guild_id: int) -> bool:
+    """メッセージ削除を監査ログに記録するか (既定は有効、壊れた値は有効扱い)。"""
+    value = get(guild_id, AUDIT_MESSAGE_DELETE, True)
+    return value if isinstance(value, bool) else True
+
+
+def get_audit_message_edit_enabled(guild_id: int) -> bool:
+    """メッセージ編集を監査ログに記録するか (既定は有効、壊れた値は有効扱い)。"""
+    value = get(guild_id, AUDIT_MESSAGE_EDIT, True)
+    return value if isinstance(value, bool) else True
+
+
+def get_audit_voice_enabled(guild_id: int) -> bool:
+    """VC の出入りを監査ログに記録するか (既定は無効 — 件数が多いため)。"""
+    value = get(guild_id, AUDIT_VOICE, False)
+    return value if isinstance(value, bool) else False
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:

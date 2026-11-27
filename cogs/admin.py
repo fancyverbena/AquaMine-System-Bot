@@ -371,6 +371,15 @@ class AdminCog(commands.Cog):
             inline=False,
         )
 
+        embed.add_field(
+            name="ウェルカム・監査ログ",
+            value=(
+                f"歓迎ch: {channel_text(settings.WELCOME_CHANNEL_ID)}"
+                f" / 監査ch: {channel_text(settings.AUDIT_LOG_CHANNEL_ID)}"
+            ),
+            inline=False,
+        )
+
         notify_roles = settings.get_ticket_notify_roles(gid)
         embed.add_field(
             name="チケット評価・担当通知",
