@@ -60,6 +60,15 @@ from cogs.tickets import (  # noqa: E402
     rating_block_reason,
     valid_ticket_type,
 )
+from cogs.serverlog import (  # noqa: E402
+    DEFAULT_WELCOME_MESSAGE,
+    UNKNOWN_CONTENT_TEXT,
+    content_or_unknown,
+    effective_welcome_template,
+    render_welcome,
+    should_log_edit,
+    truncate_content,
+)
 
 
 class TestLevelMath(unittest.TestCase):
@@ -1778,6 +1787,198 @@ class TestTicketRatingButtonDynamicItem(unittest.TestCase):
         self.assertIsNone(button.template.fullmatch("v2:fbvote:42:up"))
         self.assertIsNone(button.template.fullmatch("v2:ticketrate:abc:3"))
         self.assertIsNone(button.template.fullmatch("v2:ticketrate:42"))
+
+
+class TestRenderWelcome(unittest.TestCase):
+    def test_all_placeholders_replaced(self):
+        result = render_welcome(
+            "{member} さん、{server} へようこそ！{name} さんは {count} 人目です",
+            member_mention="<@123>",
+            name="テスト太郎",
+            server="AquaMine",
+            count=42,
+        )
+        self.assertEqual(
+            result,
+            "<@123> さん、AquaMine へようこそ！"
+            "テスト太郎 さんは 42 人目です",
+        )
+
+    def test_unknown_placeholder_preserved(self):
+        result = render_welcome(
+            "{member} {unknown} {count}",
+            member_mention="<@123>",
+            name="n",
+            server="s",
+            count=7,
+        )
+        self.assertEqual(result, "<@123> {unknown} 7")
+
+    def test_repeated_placeholder(self):
+        result = render_welcome(
+            "{name} {name}",
+            member_mention="m",
+            name="繰り返し",
+            server="s",
+            count=1,
+        )
+        self.assertEqual(result, "繰り返し 繰り返し")
+
+    def test_empty_template_renders_empty(self):
+        self.assertEqual(
+            render_welcome(
+                "",
+                member_mention="m",
+                name="n",
+                server="s",
+                count=1,
+            ),
+            "",
+        )
+
+
+class TestEffectiveWelcomeTemplate(unittest.TestCase):
+    def test_empty_uses_default(self):
+        self.assertEqual(effective_welcome_template(""), DEFAULT_WELCOME_MESSAGE)
+
+    def test_whitespace_only_uses_default(self):
+        self.assertEqual(
+            effective_welcome_template("  \n "), DEFAULT_WELCOME_MESSAGE
+        )
+
+    def test_non_string_uses_default(self):
+        self.assertEqual(effective_welcome_template(None), DEFAULT_WELCOME_MESSAGE)
+        self.assertEqual(effective_welcome_template(123), DEFAULT_WELCOME_MESSAGE)
+
+    def test_custom_template_kept(self):
+        self.assertEqual(
+            effective_welcome_template("{member} ようこそ！"),
+            "{member} ようこそ！",
+        )
+
+    def test_default_template_renders(self):
+        result = render_welcome(
+            effective_welcome_template(""),
+            member_mention="<@9>",
+            name="新規さん",
+            server="AquaMine",
+            count=100,
+        )
+        self.assertIn("<@9>", result)
+        self.assertIn("AquaMine", result)
+        self.assertIn("100", result)
+
+
+class TestServerLogSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_welcome_channel_default_and_round_trip(self):
+        self.assertEqual(settings.get_welcome_channel_id(1), 0)
+        settings.set_value(1, settings.WELCOME_CHANNEL_ID, 555)
+        self.assertEqual(settings.get_welcome_channel_id(1), 555)
+        self.assertEqual(settings.get_welcome_channel_id(2), 0)
+
+    def test_welcome_channel_corrupt_fallback(self):
+        settings.set_value(1, settings.WELCOME_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_welcome_channel_id(1), 0)
+        settings.set_value(1, settings.WELCOME_CHANNEL_ID, -3)
+        self.assertEqual(settings.get_welcome_channel_id(1), 0)
+
+    def test_welcome_message_default_and_round_trip(self):
+        self.assertEqual(settings.get_welcome_message(1), "")
+        settings.set_value(1, settings.WELCOME_MESSAGE, "{member} hi")
+        self.assertEqual(settings.get_welcome_message(1), "{member} hi")
+        self.assertEqual(settings.get_welcome_message(2), "")
+
+    def test_welcome_message_corrupt_fallback(self):
+        settings.set_value(1, settings.WELCOME_MESSAGE, 123)
+        self.assertEqual(settings.get_welcome_message(1), "")
+
+    def test_welcome_dm_default_false(self):
+        self.assertFalse(settings.get_welcome_dm_enabled(1))
+
+    def test_welcome_dm_round_trip(self):
+        settings.set_value(1, settings.WELCOME_DM_ENABLED, True)
+        self.assertTrue(settings.get_welcome_dm_enabled(1))
+        settings.set_value(1, settings.WELCOME_DM_ENABLED, False)
+        self.assertFalse(settings.get_welcome_dm_enabled(1))
+        self.assertFalse(settings.get_welcome_dm_enabled(2))
+
+    def test_welcome_dm_corrupt_fallback_false(self):
+        settings.set_value(1, settings.WELCOME_DM_ENABLED, "yes")
+        self.assertFalse(settings.get_welcome_dm_enabled(1))
+
+    def test_audit_channel_default_and_round_trip(self):
+        self.assertEqual(settings.get_audit_log_channel_id(1), 0)
+        settings.set_value(1, settings.AUDIT_LOG_CHANNEL_ID, 777)
+        self.assertEqual(settings.get_audit_log_channel_id(1), 777)
+        self.assertEqual(settings.get_audit_log_channel_id(2), 0)
+
+    def test_audit_channel_corrupt_fallback(self):
+        settings.set_value(1, settings.AUDIT_LOG_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_audit_log_channel_id(1), 0)
+        settings.set_value(1, settings.AUDIT_LOG_CHANNEL_ID, -1)
+        self.assertEqual(settings.get_audit_log_channel_id(1), 0)
+
+    def test_audit_delete_default_true(self):
+        self.assertTrue(settings.get_audit_message_delete_enabled(1))
+
+    def test_audit_delete_round_trip_and_corrupt(self):
+        settings.set_value(1, settings.AUDIT_MESSAGE_DELETE, False)
+        self.assertFalse(settings.get_audit_message_delete_enabled(1))
+        settings.set_value(1, settings.AUDIT_MESSAGE_DELETE, "abc")
+        self.assertTrue(settings.get_audit_message_delete_enabled(1))
+
+    def test_audit_edit_default_true(self):
+        self.assertTrue(settings.get_audit_message_edit_enabled(1))
+
+    def test_audit_edit_round_trip_and_corrupt(self):
+        settings.set_value(1, settings.AUDIT_MESSAGE_EDIT, False)
+        self.assertFalse(settings.get_audit_message_edit_enabled(1))
+        settings.set_value(1, settings.AUDIT_MESSAGE_EDIT, 0)
+        self.assertTrue(settings.get_audit_message_edit_enabled(1))
+
+    def test_audit_voice_default_false(self):
+        self.assertFalse(settings.get_audit_voice_enabled(1))
+
+    def test_audit_voice_round_trip_and_corrupt(self):
+        settings.set_value(1, settings.AUDIT_VOICE, True)
+        self.assertTrue(settings.get_audit_voice_enabled(1))
+        settings.set_value(1, settings.AUDIT_VOICE, "yes")
+        self.assertFalse(settings.get_audit_voice_enabled(1))
+
+
+class TestAuditLogHelpers(unittest.TestCase):
+    def test_should_log_edit_unchanged(self):
+        self.assertFalse(should_log_edit("同じ文", "同じ文"))
+        self.assertFalse(should_log_edit("", ""))
+        self.assertFalse(should_log_edit(None, ""))
+        self.assertFalse(should_log_edit(None, None))
+
+    def test_should_log_edit_changed(self):
+        self.assertTrue(should_log_edit("編集前", "編集後"))
+        self.assertTrue(should_log_edit("", "追加された"))
+        self.assertTrue(should_log_edit("消された", ""))
+
+    def test_content_or_unknown(self):
+        self.assertEqual(content_or_unknown("本文"), "本文")
+        self.assertEqual(content_or_unknown(""), UNKNOWN_CONTENT_TEXT)
+        self.assertEqual(content_or_unknown(None), UNKNOWN_CONTENT_TEXT)
+        self.assertEqual(content_or_unknown("   "), UNKNOWN_CONTENT_TEXT)
+
+    def test_truncate_content(self):
+        self.assertEqual(truncate_content("短い"), "短い")
+        long_text = "あ" * 1500
+        truncated = truncate_content(long_text)
+        self.assertEqual(len(truncated), 1000)
+        self.assertTrue(truncated.endswith("…"))
 
 
 if __name__ == "__main__":
