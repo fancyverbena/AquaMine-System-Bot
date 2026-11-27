@@ -25,6 +25,8 @@ AUTOMOD_EXEMPT_CHANNEL_IDS = "automod_exempt_channel_ids"
 AUTOMOD_AD_CHANNEL_IDS = "automod_ad_channel_ids"
 ROLE_PANEL_ROLE_IDS = "role_panel_role_ids"
 ROLE_PANEL_EXCLUSIVE = "role_panel_exclusive"
+SUGGESTION_CHANNEL_ID = "suggestion_channel_id"
+BUG_CHANNEL_ID = "bug_channel_id"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -217,6 +219,18 @@ def get_role_panel_role_ids(guild_id: int) -> list:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def get_suggestion_channel_id(guild_id: int) -> int:
+    """提案箱の投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, SUGGESTION_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_bug_channel_id(guild_id: int) -> int:
+    """バグ報告の投稿先チャンネル ID (0 は未設定)。"""
+    value = _get_int(guild_id, BUG_CHANNEL_ID, 0)
+    return value if value > 0 else 0
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:

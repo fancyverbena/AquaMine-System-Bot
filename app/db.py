@@ -9,6 +9,9 @@
   giveaways(id, guild_id, channel_id, message_id, host_id, prize,
             winner_count, ends_at, status, winners, created_at)
   giveaway_entries(giveaway_id, user_id, entered_at)
+  feedback(id, guild_id, kind, author_id, title, content,
+           channel_id, message_id, status, created_at)
+  feedback_votes(feedback_id, user_id, vote)
 
 すべてのアクセスは context manager 経由で行い、接続を漏らさない。
 """
@@ -85,6 +88,24 @@ class Database:
                         user_id INTEGER NOT NULL,
                         entered_at REAL NOT NULL,
                         PRIMARY KEY (giveaway_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS feedback (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        guild_id INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        author_id INTEGER NOT NULL,
+                        title TEXT NOT NULL DEFAULT '',
+                        content TEXT NOT NULL,
+                        channel_id INTEGER NOT NULL,
+                        message_id INTEGER,
+                        status TEXT NOT NULL,
+                        created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS feedback_votes (
+                        feedback_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        vote INTEGER NOT NULL,
+                        PRIMARY KEY (feedback_id, user_id)
                     );
                     CREATE TABLE IF NOT EXISTS tickets (
                         channel_id INTEGER PRIMARY KEY,
@@ -582,6 +603,170 @@ class Database:
                 "UPDATE giveaways SET status = ?, winners = ? WHERE id = ?",
                 (status, json.dumps([int(w) for w in (winners or [])]), giveaway_id),
             )
+
+    # ---------- feedback (提案箱・バグ報告) ----------
+
+    def create_feedback(
+        self,
+        guild_id: int,
+        kind: str,
+        author_id: int,
+        title: str,
+        content: str,
+        channel_id: int,
+        now: float,
+    ) -> int:
+        """フィードバックを1件作成し、新しい行の id を返す。
+
+        初期ステータスは kind で決まる (提案='pending'、バグ='open')。
+        message_id は投稿後に set_feedback_message で設定する。
+        """
+        status = "pending" if kind == "suggestion" else "open"
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO feedback (
+                    guild_id, kind, author_id, title, content,
+                    channel_id, message_id, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    guild_id,
+                    kind,
+                    author_id,
+                    title or "",
+                    content,
+                    channel_id,
+                    status,
+                    now,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_feedback(self, feedback_id: int):
+        """フィードバックを1件 dict で返す。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM feedback WHERE id = ?",
+                (feedback_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_feedback_message(self, feedback_id: int, message_id: int):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE feedback SET message_id = ? WHERE id = ?",
+                (message_id, feedback_id),
+            )
+
+    def set_feedback_status(self, feedback_id: int, status: str):
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE feedback SET status = ? WHERE id = ?",
+                (status, feedback_id),
+            )
+
+    def list_feedback(self, guild_id: int, kind: str = None, limit: int = 10):
+        """そのギルドのフィードバックを新しい順に返す (kind で絞り込み可)。"""
+        with self._conn() as conn:
+            if kind is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM feedback WHERE guild_id = ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (guild_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM feedback
+                    WHERE guild_id = ? AND kind = ?
+                    ORDER BY id DESC LIMIT ?
+                    """,
+                    (guild_id, kind, limit),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def set_vote(self, feedback_id: int, user_id: int, vote: int):
+        """投票を付け外しし、最新の (賛成数, 反対数) を返す。
+
+        遷移は next_vote に従う: 未投票→その側に投票、同じ側→取り消し、
+        反対側→切り替え。
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT vote FROM feedback_votes
+                WHERE feedback_id = ? AND user_id = ?
+                """,
+                (feedback_id, user_id),
+            ).fetchone()
+            current = row["vote"] if row else None
+            new_vote = next_vote(current, vote)
+            if new_vote is None:
+                conn.execute(
+                    """
+                    DELETE FROM feedback_votes
+                    WHERE feedback_id = ? AND user_id = ?
+                    """,
+                    (feedback_id, user_id),
+                )
+            elif current is None:
+                conn.execute(
+                    """
+                    INSERT INTO feedback_votes (feedback_id, user_id, vote)
+                    VALUES (?, ?, ?)
+                    """,
+                    (feedback_id, user_id, new_vote),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE feedback_votes SET vote = ?
+                    WHERE feedback_id = ? AND user_id = ?
+                    """,
+                    (new_vote, feedback_id, user_id),
+                )
+            return self._count_votes(conn, feedback_id)
+
+    @staticmethod
+    def _count_votes(conn, feedback_id: int):
+        rows = conn.execute(
+            """
+            SELECT vote, COUNT(*) AS c FROM feedback_votes
+            WHERE feedback_id = ? GROUP BY vote
+            """,
+            (feedback_id,),
+        ).fetchall()
+        up = down = 0
+        for row in rows:
+            if row["vote"] > 0:
+                up = row["c"]
+            elif row["vote"] < 0:
+                down = row["c"]
+        return up, down
+
+    def count_votes(self, feedback_id: int):
+        """(賛成数, 反対数) を返す。"""
+        with self._conn() as conn:
+            return self._count_votes(conn, feedback_id)
+
+
+def next_vote(current, clicked):
+    """投票ボタンの遷移を決める純粋関数。
+
+    current は現在の投票 (+1/-1、未投票は None)、clicked は押した側 (+1/-1)。
+    戻り値は新しい投票 (+1/-1) か、取り消しなら None。
+    - 未投票で押す → その側に投票
+    - 同じ側をもう一度押す → 取り消し (None)
+    - 反対側を押す → 切り替え
+    """
+    if current is None:
+        return clicked
+    if current == clicked:
+        return None
+    return clicked
 
 
 # Cog から使うモジュールレベルのシングルトン

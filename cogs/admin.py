@@ -362,6 +362,15 @@ class AdminCog(commands.Cog):
             inline=False,
         )
 
+        embed.add_field(
+            name="フィードバック",
+            value=(
+                f"提案ch: {channel_text(settings.SUGGESTION_CHANNEL_ID)}"
+                f" / バグch: {channel_text(settings.BUG_CHANNEL_ID)}"
+            ),
+            inline=False,
+        )
+
         level_roles = settings.get_level_roles(gid)
         if level_roles:
             lines = []
