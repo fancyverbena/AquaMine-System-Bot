@@ -22,6 +22,8 @@ AUTOMOD_MENTION_LIMIT = "automod_mention_limit"
 AUTOMOD_INVITES_ENABLED = "automod_invites_enabled"
 AUTOMOD_EXEMPT_CHANNEL_IDS = "automod_exempt_channel_ids"
 AUTOMOD_AD_CHANNEL_IDS = "automod_ad_channel_ids"
+ROLE_PANEL_ROLE_IDS = "role_panel_role_ids"
+ROLE_PANEL_EXCLUSIVE = "role_panel_exclusive"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -38,6 +40,9 @@ MIN_LENGTH_HARD_MAX = 200
 # 自動モデレーション設定のデフォルトと許容範囲
 DEFAULT_AUTOMOD_MENTION_LIMIT = 5
 MENTION_LIMIT_HARD_MAX = 50
+
+# ロールパネルの上限 (ボタンの並び順 = リストの順序)
+MAX_ROLE_PANEL_ROLES = 20
 
 # NG ワードのデフォルトセット。ギルドが独自のリストを保存するまでは
 # これが使われる (追加・削除した時点で、その内容がギルドのリストとして
@@ -187,6 +192,29 @@ def get_automod_ad_channel_ids(guild_id: int) -> list:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def get_role_panel_role_ids(guild_id: int) -> list:
+    """ロールパネルに並べるロール ID のリスト (順序 = ボタンの並び順)。"""
+    ids = get(guild_id, ROLE_PANEL_ROLE_IDS, [])
+    if not isinstance(ids, list):
+        return []
+    result = []
+    for item in ids:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def get_role_panel_exclusive(guild_id: int) -> bool:
+    """ロールパネルの排他モード (既定は無効、壊れた値は無効扱い)。
+
+    有効時はパネルのロールを付けると、他のパネルロールが外れる。
+    """
+    value = get(guild_id, ROLE_PANEL_EXCLUSIVE, False)
+    return value if isinstance(value, bool) else False
 
 
 def get_level_roles(guild_id: int) -> dict:

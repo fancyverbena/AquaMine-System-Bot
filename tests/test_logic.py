@@ -30,6 +30,11 @@ from cogs.leveling import (  # noqa: E402
     xp_block_reason,
     xp_threshold,
 )
+from cogs.roles import (  # noqa: E402
+    RoleButton,
+    panel_add_error,
+    toggle_actions,
+)
 
 
 class TestLevelMath(unittest.TestCase):
@@ -599,6 +604,112 @@ class TestRulesText(unittest.TestCase):
         for chunk in chunks:
             self.assertLessEqual(len(chunk), 2000)
         self.assertEqual("\n".join(chunks), long_text)
+
+
+class TestRolePanelToggleActions(unittest.TestCase):
+    PANEL = [10, 20, 30]
+
+    def test_add_when_missing(self):
+        to_add, to_remove = toggle_actions([], self.PANEL, 10, False)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [])
+
+    def test_remove_when_present(self):
+        to_add, to_remove = toggle_actions([10, 20], self.PANEL, 10, False)
+        self.assertEqual(to_add, [])
+        self.assertEqual(to_remove, [10])
+
+    def test_non_exclusive_keeps_other_panel_roles(self):
+        to_add, to_remove = toggle_actions([20], self.PANEL, 10, False)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [])
+
+    def test_exclusive_removes_other_panel_roles_on_add(self):
+        to_add, to_remove = toggle_actions([20, 30], self.PANEL, 10, True)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [20, 30])
+
+    def test_exclusive_remove_does_not_touch_others(self):
+        to_add, to_remove = toggle_actions([10, 20], self.PANEL, 10, True)
+        self.assertEqual(to_add, [])
+        self.assertEqual(to_remove, [10])
+
+    def test_clicked_role_not_in_panel(self):
+        self.assertEqual(toggle_actions([], self.PANEL, 99, False), ([], []))
+        self.assertEqual(toggle_actions([99], self.PANEL, 99, True), ([], []))
+
+    def test_non_panel_roles_never_touched(self):
+        # 999 はパネル外のロール: 排他モードでも外さない
+        to_add, to_remove = toggle_actions([999, 20], self.PANEL, 10, True)
+        self.assertEqual(to_add, [10])
+        self.assertEqual(to_remove, [20])
+
+
+class TestRolePanelAddError(unittest.TestCase):
+    def test_ok(self):
+        self.assertIsNone(panel_add_error([10], 20))
+        self.assertIsNone(panel_add_error([], 10))
+
+    def test_duplicate(self):
+        self.assertEqual(panel_add_error([10, 20], 20), "duplicate")
+
+    def test_full(self):
+        full = list(range(settings.MAX_ROLE_PANEL_ROLES))
+        self.assertEqual(panel_add_error(full, 9999), "full")
+        # 上限ちょうど - 1 件なら追加できる
+        almost = list(range(settings.MAX_ROLE_PANEL_ROLES - 1))
+        self.assertIsNone(panel_add_error(almost, 9999))
+
+
+class TestRolePanelSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_role_ids_default_empty(self):
+        self.assertEqual(settings.get_role_panel_role_ids(1), [])
+
+    def test_role_ids_round_trip_preserves_order(self):
+        settings.set_value(1, settings.ROLE_PANEL_ROLE_IDS, [30, 10, 20])
+        self.assertEqual(settings.get_role_panel_role_ids(1), [30, 10, 20])
+        # ギルドごとに独立
+        self.assertEqual(settings.get_role_panel_role_ids(2), [])
+
+    def test_role_ids_corrupt_fallback(self):
+        settings.set_value(1, settings.ROLE_PANEL_ROLE_IDS, "not-a-list")
+        self.assertEqual(settings.get_role_panel_role_ids(1), [])
+        # 混在した要素は数値化できるものだけ残る
+        settings.set_value(1, settings.ROLE_PANEL_ROLE_IDS, [10, "x", "20"])
+        self.assertEqual(settings.get_role_panel_role_ids(1), [10, 20])
+
+    def test_exclusive_default_and_round_trip(self):
+        self.assertFalse(settings.get_role_panel_exclusive(1))
+        settings.set_value(1, settings.ROLE_PANEL_EXCLUSIVE, True)
+        self.assertTrue(settings.get_role_panel_exclusive(1))
+        settings.set_value(1, settings.ROLE_PANEL_EXCLUSIVE, False)
+        self.assertFalse(settings.get_role_panel_exclusive(1))
+
+    def test_exclusive_corrupt_fallback(self):
+        settings.set_value(1, settings.ROLE_PANEL_EXCLUSIVE, "yes")
+        self.assertFalse(settings.get_role_panel_exclusive(1))
+
+
+class TestRoleButtonDynamicItem(unittest.TestCase):
+    def test_custom_id_and_template(self):
+        button = RoleButton(123456, label="テスト")
+        self.assertEqual(button.custom_id, "v2:role:123456")
+        self.assertEqual(button.role_id, 123456)
+        match = button.template.fullmatch("v2:role:789")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["role_id"], "789")
+        # 他のパネルの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:agree"))
+        self.assertIsNone(button.template.fullmatch("v2:role:abc"))
 
 
 if __name__ == "__main__":
