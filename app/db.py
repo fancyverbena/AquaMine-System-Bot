@@ -19,6 +19,9 @@
            channel_id, message_id, status, created_at)
   feedback_votes(feedback_id, user_id, vote)
   bump_reminders(guild_id, channel_id, bumper_id, remind_at)
+  temp_vc_channels(channel_id, guild_id, owner_id, created_at)
+          -- 一時 VC (ロビー参加で自動作成される個人用 VC) の記録。
+             再起動時に実チャンネルと照合して掃除するために使う
 
 すべてのアクセスは context manager 経由で行い、接続を漏らさない。
 """
@@ -143,6 +146,12 @@ class Database:
                         user_id INTEGER NOT NULL,
                         xp INTEGER NOT NULL,
                         PRIMARY KEY (guild_id, user_id)
+                    );
+                    CREATE TABLE IF NOT EXISTS temp_vc_channels (
+                        channel_id INTEGER PRIMARY KEY,
+                        guild_id INTEGER NOT NULL,
+                        owner_id INTEGER NOT NULL,
+                        created_at REAL NOT NULL
                     );
                     """
                 )
@@ -975,6 +984,77 @@ class Database:
                 "DELETE FROM bump_reminders WHERE guild_id = ?",
                 (guild_id,),
             )
+
+    # ---------- temp_vc_channels (一時 VC) ----------
+
+    def add_temp_vc_channel(
+        self, channel_id: int, guild_id: int, owner_id: int, now: float
+    ):
+        """作成した一時 VC を記録する。"""
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO temp_vc_channels (
+                    channel_id, guild_id, owner_id, created_at
+                ) VALUES (?, ?, ?, ?)
+                """,
+                (channel_id, guild_id, owner_id, now),
+            )
+
+    def get_temp_vc_channel(self, channel_id: int):
+        """一時 VC を1件 dict で返す。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM temp_vc_channels WHERE channel_id = ?",
+                (channel_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_temp_vc_channel_by_owner(self, guild_id: int, owner_id: int):
+        """そのギルドでそのメンバーが所有する一時 VC を返す。
+
+        通常は1人1件だけだが、古い順に1件返すことで壊れた状態でも
+        決定的に動く。なければ None。
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM temp_vc_channels
+                WHERE guild_id = ? AND owner_id = ?
+                ORDER BY created_at ASC LIMIT 1
+                """,
+                (guild_id, owner_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def remove_temp_vc_channel(self, channel_id: int):
+        """一時 VC の記録を消す (チャンネル削除時・記録の掃除用)。"""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM temp_vc_channels WHERE channel_id = ?",
+                (channel_id,),
+            )
+
+    def list_temp_vc_channels(self, guild_id: int = None):
+        """一時 VC の記録を作成順に返す (guild_id 省略時は全ギルド)。"""
+        with self._conn() as conn:
+            if guild_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM temp_vc_channels
+                    ORDER BY created_at ASC, channel_id ASC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM temp_vc_channels
+                    WHERE guild_id = ?
+                    ORDER BY created_at ASC, channel_id ASC
+                    """,
+                    (guild_id,),
+                ).fetchall()
+        return [dict(r) for r in rows]
 
     # ---------- バックアップ ----------
 

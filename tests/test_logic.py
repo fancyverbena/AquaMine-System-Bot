@@ -81,6 +81,13 @@ from cogs.weekly import (  # noqa: E402
     week_key,
     week_range_label,
 )
+from cogs.tempvc import (  # noqa: E402
+    MAX_CHANNEL_NAME_LENGTH,
+    join_action,
+    public_overwrites,
+    should_delete,
+    temp_channel_name,
+)
 
 
 class TestLevelMath(unittest.TestCase):
@@ -2293,6 +2300,133 @@ class TestWeeklySettings(unittest.TestCase):
     def test_last_week_corrupt_fallback(self):
         settings.set_value(1, settings.WEEKLY_RANKING_LAST_WEEK, 20261123)
         self.assertEqual(settings.get_weekly_ranking_last_week(1), "")
+
+
+class TestTempVcChannelName(unittest.TestCase):
+    def test_normal_name(self):
+        self.assertEqual(temp_channel_name("たろう"), "たろう の VC")
+        # 表示名は sanitize_channel_part を通る (小文字化される)
+        self.assertEqual(temp_channel_name("Taro"), "taro の VC")
+
+    def test_long_name_is_capped(self):
+        name = temp_channel_name("あ" * 200)
+        self.assertLessEqual(len(name), MAX_CHANNEL_NAME_LENGTH)
+        self.assertTrue(name.endswith(" の VC"))
+
+    def test_empty_name_falls_back(self):
+        self.assertEqual(temp_channel_name(""), "member の VC")
+        self.assertEqual(temp_channel_name("   "), "member の VC")
+        self.assertEqual(temp_channel_name(None), "member の VC")
+
+
+class TestTempVcShouldDelete(unittest.TestCase):
+    def test_empty_is_deleted(self):
+        # Bot を除くメンバーが0人なら削除 (音楽Botだけの状態もここに来る)
+        self.assertTrue(should_delete(0))
+
+    def test_occupied_is_kept(self):
+        self.assertFalse(should_delete(1))
+        self.assertFalse(should_delete(5))
+
+
+class TestTempVcJoinAction(unittest.TestCase):
+    def test_create_when_no_existing(self):
+        self.assertEqual(join_action(None), "create")
+
+    def test_reuse_when_existing(self):
+        row = {"channel_id": 123, "guild_id": 1, "owner_id": 42}
+        self.assertEqual(join_action(row), "reuse")
+
+
+class TestTempVcPublicOverwrites(unittest.TestCase):
+    def test_everyone_can_view_and_connect(self):
+        # @everyone (default_role) には「見る」「接続」だけを許可する
+        overwrites = public_overwrites(999)
+        self.assertEqual(list(overwrites.keys()), [999])
+        overwrite = overwrites[999]
+        self.assertIs(overwrite.view_channel, True)
+        self.assertIs(overwrite.connect, True)
+        # それ以外の権限には触れない (未設定 = None)
+        self.assertIsNone(overwrite.speak)
+        self.assertIsNone(overwrite.send_messages)
+        self.assertIsNone(overwrite.mention_everyone)
+
+
+class TestTempVcDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_add_get_round_trip(self):
+        self.assertIsNone(self.db.get_temp_vc_channel(100))
+        self.db.add_temp_vc_channel(100, 1, 42, 1000.0)
+        row = self.db.get_temp_vc_channel(100)
+        self.assertEqual(row["guild_id"], 1)
+        self.assertEqual(row["owner_id"], 42)
+        self.assertEqual(row["created_at"], 1000.0)
+
+    def test_get_by_owner(self):
+        self.db.add_temp_vc_channel(100, 1, 42, 1000.0)
+        self.db.add_temp_vc_channel(200, 1, 43, 1001.0)
+        row = self.db.get_temp_vc_channel_by_owner(1, 43)
+        self.assertEqual(row["channel_id"], 200)
+        self.assertIsNone(self.db.get_temp_vc_channel_by_owner(1, 999))
+        # ギルドが違えば見つからない
+        self.assertIsNone(self.db.get_temp_vc_channel_by_owner(2, 42))
+
+    def test_list_and_guild_isolation(self):
+        self.db.add_temp_vc_channel(100, 1, 42, 1000.0)
+        self.db.add_temp_vc_channel(200, 2, 43, 1001.0)
+        self.db.add_temp_vc_channel(300, 1, 44, 1002.0)
+        self.assertEqual(
+            [r["channel_id"] for r in self.db.list_temp_vc_channels()],
+            [100, 200, 300],
+        )
+        self.assertEqual(
+            [r["channel_id"] for r in self.db.list_temp_vc_channels(1)],
+            [100, 300],
+        )
+        self.assertEqual(
+            [r["channel_id"] for r in self.db.list_temp_vc_channels(2)],
+            [200],
+        )
+
+    def test_remove(self):
+        self.db.add_temp_vc_channel(100, 1, 42, 1000.0)
+        self.db.remove_temp_vc_channel(100)
+        self.assertIsNone(self.db.get_temp_vc_channel(100))
+        self.assertEqual(self.db.list_temp_vc_channels(), [])
+
+
+class TestTempVcSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_lobby_default_unset(self):
+        self.assertEqual(settings.get_temp_vc_lobby_id(1), 0)
+
+    def test_lobby_round_trip(self):
+        settings.set_value(1, settings.TEMP_VC_LOBBY_ID, 555)
+        self.assertEqual(settings.get_temp_vc_lobby_id(1), 555)
+        # ギルドごとに独立
+        self.assertEqual(settings.get_temp_vc_lobby_id(2), 0)
+        settings.set_value(1, settings.TEMP_VC_LOBBY_ID, 0)
+        self.assertEqual(settings.get_temp_vc_lobby_id(1), 0)
+
+    def test_lobby_corrupt_fallback(self):
+        settings.set_value(1, settings.TEMP_VC_LOBBY_ID, "abc")
+        self.assertEqual(settings.get_temp_vc_lobby_id(1), 0)
+        settings.set_value(1, settings.TEMP_VC_LOBBY_ID, -3)
+        self.assertEqual(settings.get_temp_vc_lobby_id(1), 0)
 
 
 if __name__ == "__main__":
