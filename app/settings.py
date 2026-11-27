@@ -44,6 +44,7 @@ AUDIT_MESSAGE_EDIT = "audit_message_edit"
 AUDIT_VOICE = "audit_voice"
 WEEKLY_RANKING_CHANNEL_ID = "weekly_ranking_channel_id"
 WEEKLY_RANKING_LAST_WEEK = "weekly_ranking_last_week"
+TEMP_VC_LOBBY_ID = "temp_vc_lobby_id"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -414,6 +415,12 @@ def get_weekly_ranking_last_week(guild_id: int) -> str:
     """
     value = get(guild_id, WEEKLY_RANKING_LAST_WEEK, "")
     return value if isinstance(value, str) else ""
+
+
+def get_temp_vc_lobby_id(guild_id: int) -> int:
+    """一時 VC のロビーチャンネル ID (0 は未設定 = 機能オフ)。"""
+    value = _get_int(guild_id, TEMP_VC_LOBBY_ID, 0)
+    return value if value > 0 else 0
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:
