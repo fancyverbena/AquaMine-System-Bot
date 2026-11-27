@@ -21,6 +21,7 @@ AUTOMOD_NGWORDS = "automod_ngwords"
 AUTOMOD_LOG_CHANNEL_ID = "automod_log_channel_id"
 AUTOMOD_MENTION_LIMIT = "automod_mention_limit"
 AUTOMOD_INVITES_ENABLED = "automod_invites_enabled"
+AUTOMOD_LINK_RESTRICT_DAYS = "automod_link_restrict_days"
 AUTOMOD_EXEMPT_CHANNEL_IDS = "automod_exempt_channel_ids"
 AUTOMOD_AD_CHANNEL_IDS = "automod_ad_channel_ids"
 ROLE_PANEL_ROLE_IDS = "role_panel_role_ids"
@@ -59,6 +60,8 @@ VC_XP_HARD_MAX = 1000
 # 自動モデレーション設定のデフォルトと許容範囲
 DEFAULT_AUTOMOD_MENTION_LIMIT = 5
 MENTION_LIMIT_HARD_MAX = 50
+DEFAULT_AUTOMOD_LINK_RESTRICT_DAYS = 7
+LINK_RESTRICT_DAYS_HARD_MAX = 90
 
 # ロールパネルの上限 (ボタンの並び順 = リストの順序)
 MAX_ROLE_PANEL_ROLES = 20
@@ -190,6 +193,21 @@ def get_automod_mention_limit(guild_id: int) -> int:
     )
     if not (0 <= value <= MENTION_LIMIT_HARD_MAX):
         return DEFAULT_AUTOMOD_MENTION_LIMIT
+    return value
+
+
+def get_automod_link_restrict_days(guild_id: int) -> int:
+    """新規メンバーのリンク制限の日数 (参加からこの日数はリンク投稿不可)。
+
+    0 で制限無効、範囲外・壊れた値はデフォルト。
+    """
+    value = _get_int(
+        guild_id,
+        AUTOMOD_LINK_RESTRICT_DAYS,
+        DEFAULT_AUTOMOD_LINK_RESTRICT_DAYS,
+    )
+    if not (0 <= value <= LINK_RESTRICT_DAYS_HARD_MAX):
+        return DEFAULT_AUTOMOD_LINK_RESTRICT_DAYS
     return value
 
 

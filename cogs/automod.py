@@ -5,6 +5,7 @@
   - スパム (短時間の連投 / 同一内容の繰り返し、判定はメモリ上のみ)
   - メンション乱用 (ユーザー+ロールのメンション数がしきい値以上)
   - Discord 招待リンク (設定で無効化可能)
+  - 新規メンバーのリンク投稿 (参加から設定日数の間は http(s) リンク不可)
 
 違反すると発言を削除して違反履歴 (DB) に記録し、直近30日の違反回数に
 応じて段階的に処罰する: 10回目まで=警告のみ、11回目=タイムアウト10分、
@@ -40,6 +41,7 @@ TIMEOUT_MINUTES = 10
 
 NGWORD_MAX_LENGTH = 50
 MENTION_LIMIT_MAX = settings.MENTION_LIMIT_HARD_MAX
+LINK_RESTRICT_DAYS_MAX = settings.LINK_RESTRICT_DAYS_HARD_MAX
 
 REASON_LABELS = {
     "ngword": "NGワード",
@@ -47,6 +49,7 @@ REASON_LABELS = {
     "repeat": "スパム（同一内容の繰り返し）",
     "mention": "メンション乱用",
     "invite": "招待リンク",
+    "new_member_link": "新規メンバーのリンク制限",
 }
 
 PUNISHMENT_LABELS = {
@@ -69,6 +72,9 @@ INVITE_REGEX = re.compile(
     r"(?:discord\.gg|discord\.com/invite|discordapp\.com/invite)/",
     re.IGNORECASE,
 )
+
+# http(s) リンクの検知 (スキーム付き URL のみ。ベアドメインは対象外)
+LINK_REGEX = re.compile(r"https?://", re.IGNORECASE)
 
 
 def punishment_for_count(count: int) -> str:
@@ -138,6 +144,47 @@ def find_invite(content):
         if pattern.search(text):
             return label
     return None
+
+
+def contains_link(content) -> bool:
+    """本文に http:// または https:// のリンクが含まれるか (大文字小文字不問)。
+
+    スキームなしのベアドメイン (example.com など) はリンクとみなさない。
+    """
+    return bool(LINK_REGEX.search(content or ""))
+
+
+def is_link_restricted(joined_at, now, days) -> bool:
+    """参加から days 日以内ならリンク制限の対象かどうか。
+
+    days が 0 以下なら制限自体が無効。joined_at が None (参加日時不明)
+    の場合は処罰しない (フェイルオープン)。ちょうど days 日経過した
+    時点で制限は解ける。
+    """
+    if days is None or days <= 0:
+        return False
+    if joined_at is None:
+        return False
+    return now - joined_at < datetime.timedelta(days=days)
+
+
+def link_restriction_violation(content, joined_at, now, days,
+                               allow_links=False):
+    """新規メンバーのリンク制限の違反判定。(理由キー, 詳細) か None を返す。
+
+    allow_links が True (宣伝許可チャンネル) の場合は検知しない。
+    詳細は DM・ログ向けに「参加から何日間はリンク不可」である旨を含める。
+    """
+    if allow_links:
+        return None
+    if not contains_link(content):
+        return None
+    if not is_link_restricted(joined_at, now, days):
+        return None
+    return (
+        "new_member_link",
+        f"サーバー参加から{days}日間はリンクを投稿できません",
+    )
 
 
 def content_violation(content, ngwords, mention_total, mention_limit,
@@ -214,6 +261,15 @@ class AutoModCog(commands.Cog):
             settings.get_automod_invites_enabled(guild.id),
             allow_invites=allow_invites,
         )
+        if violation is None:
+            # 新規メンバーのリンク制限 (宣伝許可チャンネルでは検知しない)
+            violation = link_restriction_violation(
+                content,
+                member.joined_at,
+                discord.utils.utcnow(),
+                settings.get_automod_link_restrict_days(guild.id),
+                allow_links=allow_invites,
+            )
         if violation is None:
             reason = spam_reason(buffer, now)
             if reason is not None:
@@ -394,6 +450,12 @@ class AutoModCog(commands.Cog):
             f"メンション上限: {limit if limit > 0 else '無効（0）'}",
             "招待リンク検知: "
             + ("ON" if settings.get_automod_invites_enabled(gid) else "OFF"),
+            "新規メンバーのリンク制限: "
+            + (
+                f"参加から {settings.get_automod_link_restrict_days(gid)} 日間"
+                if settings.get_automod_link_restrict_days(gid) > 0
+                else "無効（0）"
+            ),
             "ログチャンネル: "
             + (log_channel.mention if log_channel else "未設定"),
             "対象外チャンネル: "
@@ -559,6 +621,37 @@ class AutoModCog(commands.Cog):
         )
 
     @automod_group.command(
+        name="link-restrict",
+        description="新規メンバーのリンク制限の日数を設定します（0で無効）",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(days="参加後リンクを制限する日数（0〜90）")
+    async def automod_link_restrict(
+        self, interaction: discord.Interaction, days: int
+    ):
+        if not self._guard_admin_guild(interaction):
+            await self._reject(interaction)
+            return
+        if not (0 <= days <= LINK_RESTRICT_DAYS_MAX):
+            await reply_error(
+                interaction,
+                f"リンク制限の日数は 0 〜 {LINK_RESTRICT_DAYS_MAX} で指定してください。",
+            )
+            return
+        settings.set_value(
+            interaction.guild.id, settings.AUTOMOD_LINK_RESTRICT_DAYS, days
+        )
+        await interaction.response.send_message(
+            "✅ 新規メンバーのリンク制限を "
+            + (
+                f"参加から {days} 日間に設定しました。"
+                if days > 0
+                else "無効（0）にしました。"
+            ),
+            ephemeral=True,
+        )
+
+    @automod_group.command(
         name="exempt-channel",
         description="チャンネルの対象外/対象内を切り替えます",
     )
@@ -603,7 +696,7 @@ class AutoModCog(commands.Cog):
         else:
             ids.append(channel.id)
             settings.set_value(gid, settings.AUTOMOD_AD_CHANNEL_IDS, ids)
-            text = f"✅ {channel.mention} を**宣伝許可チャンネルにしました**（招待リンクは検知されません。NGワード・スパム・メンション検知は有効なままです）。"
+            text = f"✅ {channel.mention} を**宣伝許可チャンネルにしました**（招待リンクと新規メンバーのリンク制限は検知されません。NGワード・スパム・メンション検知は有効なままです）。"
         await interaction.response.send_message(text, ephemeral=True)
 
     @automod_group.command(
