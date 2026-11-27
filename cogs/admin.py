@@ -327,12 +327,14 @@ class AdminCog(commands.Cog):
         )
 
         xp_config = settings.get_xp_config(gid)
+        vc_xp = settings.get_vc_xp_per_minute(gid)
         embed.add_field(
             name="レベリング",
             value=(
                 f"XP {xp_config['xp_min']}〜{xp_config['xp_max']}"
                 f" / クールダウン {xp_config['xp_cooldown_seconds']}秒"
                 f" / 最小 {xp_config['xp_min_length']}文字"
+                + (f" / VC {vc_xp} XP/分" if vc_xp > 0 else " / VC 無効")
             ),
             inline=False,
         )

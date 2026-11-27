@@ -21,12 +21,15 @@ from cogs.automod import (  # noqa: E402
 )
 from cogs.leveling import (  # noqa: E402
     RECENT_CONTENT_HASH_LIMIT,
+    VC_TICK_SECONDS,
+    advance_vc_sessions,
     calc_level,
     content_hash,
     level_progress,
     next_recent_hashes,
     normalize_content,
     validate_xp_config,
+    vc_eligible,
     xp_block_reason,
     xp_threshold,
 )
@@ -856,6 +859,145 @@ class TestGiveawayDatabase(unittest.TestCase):
         row2 = self.db.get_giveaway(gid2)
         self.assertEqual(row2["status"], "cancelled")
         self.assertEqual(row2["winners"], [])
+
+
+class TestVcEligible(unittest.TestCase):
+    def test_all_good(self):
+        self.assertTrue(
+            vc_eligible(
+                is_bot=False,
+                is_afk_channel=False,
+                self_deaf=False,
+                deaf=False,
+                human_count=2,
+            )
+        )
+        self.assertTrue(
+            vc_eligible(
+                is_bot=False,
+                is_afk_channel=False,
+                self_deaf=False,
+                deaf=False,
+                human_count=5,
+            )
+        )
+
+    def test_bot_excluded(self):
+        self.assertFalse(vc_eligible(True, False, False, False, 3))
+
+    def test_afk_channel_excluded(self):
+        self.assertFalse(vc_eligible(False, True, False, False, 3))
+
+    def test_self_deaf_excluded(self):
+        self.assertFalse(vc_eligible(False, False, True, False, 3))
+
+    def test_server_deaf_excluded(self):
+        self.assertFalse(vc_eligible(False, False, False, True, 3))
+
+    def test_alone_excluded(self):
+        self.assertFalse(vc_eligible(False, False, False, False, 1))
+        self.assertFalse(vc_eligible(False, False, False, False, 0))
+
+
+class TestVcSessions(unittest.TestCase):
+    KEY = (100, 200)
+
+    def test_young_session_gets_no_grant(self):
+        sessions = {self.KEY: 1000.0}
+        grants, updated = advance_vc_sessions(
+            sessions, 1000.0 + VC_TICK_SECONDS - 1, {self.KEY}
+        )
+        self.assertEqual(grants, [])
+        # 開始時刻はそのまま保持される
+        self.assertEqual(updated, {self.KEY: 1000.0})
+
+    def test_due_session_gets_one_grant_and_clock_resets(self):
+        sessions = {self.KEY: 1000.0}
+        now = 1000.0 + VC_TICK_SECONDS
+        grants, updated = advance_vc_sessions(sessions, now, {self.KEY})
+        self.assertEqual(grants, [self.KEY])
+        self.assertEqual(updated, {self.KEY: now})
+
+    def test_long_session_still_one_grant_per_tick(self):
+        # 5分経っていても1ティックの付与は1分分だけ (端数は持ち越さない)
+        sessions = {self.KEY: 1000.0}
+        now = 1000.0 + 5 * VC_TICK_SECONDS
+        grants, updated = advance_vc_sessions(sessions, now, {self.KEY})
+        self.assertEqual(grants, [self.KEY])
+        self.assertEqual(updated, {self.KEY: now})
+
+    def test_ineligible_session_dropped_without_grant(self):
+        # 60秒以上経過していても、対象でなくなっていれば破棄のみ
+        sessions = {self.KEY: 1000.0}
+        grants, updated = advance_vc_sessions(
+            sessions, 1000.0 + 10 * VC_TICK_SECONDS, set()
+        )
+        self.assertEqual(grants, [])
+        self.assertEqual(updated, {})
+
+    def test_mixed_sessions(self):
+        due = (100, 1)
+        young = (100, 2)
+        gone = (100, 3)
+        sessions = {due: 0.0, young: 1000.0, gone: 0.0}
+        grants, updated = advance_vc_sessions(
+            sessions, 1000.0 + 30, {due, young}
+        )
+        self.assertEqual(grants, [due])
+        self.assertEqual(updated[due], 1030.0)
+        self.assertEqual(updated[young], 1000.0)
+        self.assertNotIn(gone, updated)
+
+
+class TestVcXpSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_default(self):
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+
+    def test_round_trip(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 5)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 5)
+        # ギルドごとに独立
+        self.assertEqual(settings.get_vc_xp_per_minute(2), 2)
+
+    def test_zero_means_disabled(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 0)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 0)
+
+    def test_corrupt_fallback(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, "abc")
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+
+    def test_out_of_range_fallback(self):
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 1001)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, -1)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 2)
+        # 境界値は有効
+        settings.set_value(1, settings.VC_XP_PER_MINUTE, 1000)
+        self.assertEqual(settings.get_vc_xp_per_minute(1), 1000)
+
+
+class TestVcXpConfigValidation(unittest.TestCase):
+    def test_vc_field_valid(self):
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, 0))
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, 2))
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, 1000))
+        # 省略時 (None) は VC 検証をスキップし、既存の検証はそのまま効く
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3))
+        self.assertIsNone(validate_xp_config(10, 25, 30, 3, None))
+
+    def test_vc_field_invalid(self):
+        self.assertIsNotNone(validate_xp_config(10, 25, 30, 3, -1))
+        self.assertIsNotNone(validate_xp_config(10, 25, 30, 3, 1001))
 
 
 class TestGiveawayButtonDynamicItem(unittest.TestCase):
