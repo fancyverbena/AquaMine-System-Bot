@@ -18,7 +18,11 @@ class Bot(commands.Bot):
         from cogs.feedback import FeedbackStatusButton, FeedbackVoteButton
         from cogs.giveaway import GiveawayButton
         from cogs.roles import RoleButton
-        from cogs.tickets import TicketControlsView, TicketPanelView
+        from cogs.tickets import (
+            TicketControlsView,
+            TicketPanelView,
+            TicketRatingButton,
+        )
         from cogs.verify import AgreeView
 
         # 永続 View (再起動後も既存パネルのボタン/セレクトが効くように)
@@ -31,6 +35,7 @@ class Bot(commands.Bot):
         self.add_dynamic_items(GiveawayButton)
         self.add_dynamic_items(FeedbackVoteButton)
         self.add_dynamic_items(FeedbackStatusButton)
+        self.add_dynamic_items(TicketRatingButton)
 
         for extension in (
             "cogs.admin",
