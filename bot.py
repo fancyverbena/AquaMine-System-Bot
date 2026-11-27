@@ -2,7 +2,7 @@
 
 構成:
   app/   共通基盤 (設定, DB, UI, 権限チェック)
-  cogs/  機能ごと (admin, verify, tickets, leveling, automod, roles, help)
+  cogs/  機能ごと (admin, verify, tickets, leveling, automod, roles, giveaway, help)
 データはすべて data/bot.db (SQLite) に保存される。
 """
 import discord
@@ -14,6 +14,7 @@ from app import config
 
 class Bot(commands.Bot):
     async def setup_hook(self):
+        from cogs.giveaway import GiveawayButton
         from cogs.roles import RoleButton
         from cogs.tickets import TicketControlsView, TicketPanelView
         from cogs.verify import AgreeView
@@ -22,8 +23,9 @@ class Bot(commands.Bot):
         self.add_view(AgreeView())
         self.add_view(TicketPanelView())
         self.add_view(TicketControlsView())
-        # ロールパネルのボタンは custom_id にロール ID を埋め込む動的アイテム
+        # ロールパネル・抽選のボタンは custom_id に ID を埋め込む動的アイテム
         self.add_dynamic_items(RoleButton)
+        self.add_dynamic_items(GiveawayButton)
 
         for extension in (
             "cogs.admin",
@@ -32,6 +34,7 @@ class Bot(commands.Bot):
             "cogs.leveling",
             "cogs.automod",
             "cogs.roles",
+            "cogs.giveaway",
             "cogs.help",
         ):
             await self.load_extension(extension)

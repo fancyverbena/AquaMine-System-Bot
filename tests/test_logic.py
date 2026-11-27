@@ -30,6 +30,11 @@ from cogs.leveling import (  # noqa: E402
     xp_block_reason,
     xp_threshold,
 )
+from cogs.giveaway import (  # noqa: E402
+    GiveawayButton,
+    draw_winners,
+    parse_duration,
+)
 from cogs.roles import (  # noqa: E402
     RoleButton,
     panel_add_error,
@@ -710,6 +715,162 @@ class TestRoleButtonDynamicItem(unittest.TestCase):
         # 他のパネルの custom_id にはマッチしない
         self.assertIsNone(button.template.fullmatch("v2:agree"))
         self.assertIsNone(button.template.fullmatch("v2:role:abc"))
+
+
+class TestGiveawayParseDuration(unittest.TestCase):
+    def test_units(self):
+        self.assertEqual(parse_duration("30s"), 30)
+        self.assertEqual(parse_duration("10m"), 600)
+        self.assertEqual(parse_duration("2h"), 7200)
+        self.assertEqual(parse_duration("1d"), 86400)
+        # 24h と 1d は等しい
+        self.assertEqual(parse_duration("24h"), 86400)
+
+    def test_case_and_whitespace(self):
+        self.assertEqual(parse_duration(" 10M "), 600)
+        self.assertEqual(parse_duration("2H"), 7200)
+        self.assertEqual(parse_duration(" 1d"), 86400)
+
+    def test_range_boundaries(self):
+        self.assertEqual(parse_duration("10s"), 10)
+        self.assertEqual(parse_duration("30d"), 30 * 24 * 3600)
+
+    def test_out_of_range(self):
+        self.assertIsNone(parse_duration("9s"))
+        self.assertIsNone(parse_duration("0m"))
+        self.assertIsNone(parse_duration("31d"))
+
+    def test_invalid(self):
+        self.assertIsNone(parse_duration(""))
+        self.assertIsNone(parse_duration("abc"))
+        self.assertIsNone(parse_duration("10"))
+        self.assertIsNone(parse_duration("10x"))
+        self.assertIsNone(parse_duration("1.5h"))
+        self.assertIsNone(parse_duration("-5m"))
+        self.assertIsNone(parse_duration("10mm"))
+        self.assertIsNone(parse_duration("10分"))
+        self.assertIsNone(parse_duration(None))
+
+
+class TestGiveawayDrawWinners(unittest.TestCase):
+    def test_seeded_draw(self):
+        import random
+
+        entries = [101, 102, 103, 104, 105, 106]
+        winners = draw_winners(entries, 3, rng=random.Random(42))
+        self.assertEqual(len(winners), 3)
+        # 重複なし・全員が参加者の中から選ばれている
+        self.assertEqual(len(set(winners)), 3)
+        self.assertTrue(set(winners) <= set(entries))
+        # 同じシードでは再現する
+        again = draw_winners(entries, 3, rng=random.Random(42))
+        self.assertEqual(winners, again)
+
+    def test_more_winners_than_entries(self):
+        self.assertEqual(sorted(draw_winners([7, 8], 5)), [7, 8])
+
+    def test_all_entries_win_when_equal(self):
+        self.assertEqual(sorted(draw_winners([1, 2, 3], 3)), [1, 2, 3])
+
+    def test_empty_entries(self):
+        self.assertEqual(draw_winners([], 3), [])
+        self.assertEqual(draw_winners(None, 3), [])
+
+
+class TestGiveawayDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _create(self, guild_id=100, ends_at=2000.0, now=1000.0):
+        return self.db.create_giveaway(
+            guild_id, 555, 999, "ダイヤ装備", 2, ends_at, now
+        )
+
+    def test_create_get_round_trip(self):
+        gid = self._create()
+        row = self.db.get_giveaway(gid)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["channel_id"], 555)
+        self.assertIsNone(row["message_id"])
+        self.assertEqual(row["host_id"], 999)
+        self.assertEqual(row["prize"], "ダイヤ装備")
+        self.assertEqual(row["winner_count"], 2)
+        self.assertEqual(row["ends_at"], 2000.0)
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["winners"], [])
+        self.assertIsNone(self.db.get_giveaway(99999))
+
+        self.db.set_giveaway_message(gid, 777)
+        self.assertEqual(self.db.get_giveaway(gid)["message_id"], 777)
+
+    def test_toggle_entry(self):
+        gid = self._create()
+        # 参加 → True、もう一度 → 取り消しで False
+        self.assertTrue(self.db.toggle_entry(gid, 7, 1000.0))
+        self.assertEqual(self.db.count_entries(gid), 1)
+        self.assertFalse(self.db.toggle_entry(gid, 7, 1001.0))
+        self.assertEqual(self.db.count_entries(gid), 0)
+        # 別のユーザーは独立
+        self.assertTrue(self.db.toggle_entry(gid, 7, 1002.0))
+        self.assertTrue(self.db.toggle_entry(gid, 8, 1003.0))
+        self.assertEqual(self.db.count_entries(gid), 2)
+        self.assertEqual(self.db.list_entry_user_ids(gid), [7, 8])
+        # 他の抽選には影響しない
+        other = self._create()
+        self.assertEqual(self.db.count_entries(other), 0)
+
+    def test_list_active_and_overdue(self):
+        past = self._create(ends_at=500.0)
+        future = self._create(ends_at=5000.0)
+        other_guild = self._create(guild_id=200, ends_at=500.0)
+
+        active = self.db.list_active_giveaways(100)
+        self.assertEqual([r["id"] for r in active], [past, future])
+
+        overdue = self.db.list_overdue_giveaways(1000.0)
+        self.assertEqual([r["id"] for r in overdue], [past, other_guild])
+
+        # 終了したものはどちらにも出ない
+        self.db.finish_giveaway(past, "ended", [7])
+        self.assertEqual(
+            [r["id"] for r in self.db.list_overdue_giveaways(1000.0)],
+            [other_guild],
+        )
+        self.assertEqual(
+            [r["id"] for r in self.db.list_active_giveaways(100)], [future]
+        )
+
+    def test_finish_stores_winners(self):
+        gid = self._create()
+        self.db.finish_giveaway(gid, "ended", [7, 8])
+        row = self.db.get_giveaway(gid)
+        self.assertEqual(row["status"], "ended")
+        self.assertEqual(row["winners"], [7, 8])
+        # キャンセル時は当選者なし
+        gid2 = self._create()
+        self.db.finish_giveaway(gid2, "cancelled", [])
+        row2 = self.db.get_giveaway(gid2)
+        self.assertEqual(row2["status"], "cancelled")
+        self.assertEqual(row2["winners"], [])
+
+
+class TestGiveawayButtonDynamicItem(unittest.TestCase):
+    def test_custom_id_and_template(self):
+        button = GiveawayButton(42)
+        self.assertEqual(button.custom_id, "v2:giveaway:42")
+        self.assertEqual(button.giveaway_id, 42)
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:giveaway:123")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["giveaway_id"], "123")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:123"))
+        self.assertIsNone(button.template.fullmatch("v2:agree"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:abc"))
 
 
 if __name__ == "__main__":
