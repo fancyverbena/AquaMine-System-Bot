@@ -3,6 +3,9 @@
 テーブル:
   guild_settings(guild_id, key, value)  -- value は JSON 文字列
   user_xp(user_id, guild_id, xp, level, last_message_time, recent_content_hashes)
+  xp_weekly_baseline(guild_id, user_id, xp)
+          -- 週間ランキング用。週の開始時点の累計 XP スナップショットで、
+             現在の累計との差分が「その週に増えた XP」になる
   tickets(channel_id, guild_id, owner_id, assignee_id, ticket_type,
           subject, message_id, created_at, last_activity_at)
   ticket_ratings(ticket_id, guild_id, user_id, rating, created_at)
@@ -134,6 +137,12 @@ class Database:
                         user_id INTEGER NOT NULL,
                         rating INTEGER NOT NULL,
                         created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS xp_weekly_baseline (
+                        guild_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        xp INTEGER NOT NULL,
+                        PRIMARY KEY (guild_id, user_id)
                     );
                     """
                 )
@@ -310,6 +319,63 @@ class Database:
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT COUNT(*) AS c FROM user_xp WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+        return row["c"] if row else 0
+
+    def get_all_user_xp(self, guild_id: int):
+        """ギルド全員の (user_id, 累計 XP) を user_id 順に返す。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, xp FROM user_xp
+                WHERE guild_id = ?
+                ORDER BY user_id ASC
+                """,
+                (guild_id,),
+            ).fetchall()
+        return [(r["user_id"], r["xp"]) for r in rows]
+
+    # ---------- xp_weekly_baseline (週間ランキングの基準スナップショット) ----------
+
+    def get_xp_baselines(self, guild_id: int) -> dict:
+        """週開始時点の累計 XP を {user_id: xp} で返す。"""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id, xp FROM xp_weekly_baseline
+                WHERE guild_id = ?
+                """,
+                (guild_id,),
+            ).fetchall()
+        return {r["user_id"]: r["xp"] for r in rows}
+
+    def replace_xp_baselines(self, guild_id: int, rows):
+        """ギルドの基準スナップショットを rows で丸ごと差し替える。
+
+        rows は (user_id, xp) の列。削除と挿入は同一トランザクションで
+        行うため、途中で失敗しても中途半端な状態にはならない。
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM xp_weekly_baseline WHERE guild_id = ?",
+                (guild_id,),
+            )
+            conn.executemany(
+                """
+                INSERT INTO xp_weekly_baseline (guild_id, user_id, xp)
+                VALUES (?, ?, ?)
+                """,
+                [(guild_id, int(user_id), int(xp)) for user_id, xp in rows],
+            )
+
+    def count_xp_baselines(self, guild_id: int) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM xp_weekly_baseline
+                WHERE guild_id = ?
+                """,
                 (guild_id,),
             ).fetchone()
         return row["c"] if row else 0

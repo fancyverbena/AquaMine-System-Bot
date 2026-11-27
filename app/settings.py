@@ -42,6 +42,8 @@ AUDIT_LOG_CHANNEL_ID = "audit_log_channel_id"
 AUDIT_MESSAGE_DELETE = "audit_message_delete"
 AUDIT_MESSAGE_EDIT = "audit_message_edit"
 AUDIT_VOICE = "audit_voice"
+WEEKLY_RANKING_CHANNEL_ID = "weekly_ranking_channel_id"
+WEEKLY_RANKING_LAST_WEEK = "weekly_ranking_last_week"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -397,6 +399,21 @@ def get_audit_voice_enabled(guild_id: int) -> bool:
     """VC の出入りを監査ログに記録するか (既定は無効 — 件数が多いため)。"""
     value = get(guild_id, AUDIT_VOICE, False)
     return value if isinstance(value, bool) else False
+
+
+def get_weekly_ranking_channel_id(guild_id: int) -> int:
+    """週間 XP ランキングの自動投稿先チャンネル ID (0 は未設定 = 投稿オフ)。"""
+    value = _get_int(guild_id, WEEKLY_RANKING_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_weekly_ranking_last_week(guild_id: int) -> str:
+    """最後に週間ランキングを投稿した週のキー (週開始の月曜日の日付)。
+
+    未投稿・壊れた値は空文字。二重投稿の防止に使う。
+    """
+    value = get(guild_id, WEEKLY_RANKING_LAST_WEEK, "")
+    return value if isinstance(value, str) else ""
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:

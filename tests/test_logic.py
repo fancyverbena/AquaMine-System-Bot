@@ -73,6 +73,14 @@ from cogs.serverlog import (  # noqa: E402
     should_log_edit,
     truncate_content,
 )
+from cogs.weekly import (  # noqa: E402
+    JST,
+    compute_gains,
+    previous_week_key,
+    should_post,
+    week_key,
+    week_range_label,
+)
 
 
 class TestLevelMath(unittest.TestCase):
@@ -2093,6 +2101,198 @@ class TestAutomodLinkRestrictSettings(unittest.TestCase):
     def test_corrupt_fallback(self):
         settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, "abc")
         self.assertEqual(settings.get_automod_link_restrict_days(1), 7)
+
+
+def _jst(year, month, day, hour=0, minute=0):
+    return datetime.datetime(year, month, day, hour, minute, tzinfo=JST)
+
+
+def _utc(year, month, day, hour=0, minute=0):
+    return datetime.datetime(
+        year, month, day, hour, minute, tzinfo=datetime.timezone.utc
+    )
+
+
+class TestWeekKey(unittest.TestCase):
+    # 2026-11-23 は月曜日、11-25 は水曜日、11-29 は日曜日
+    def test_wednesday_maps_to_monday(self):
+        self.assertEqual(week_key(_jst(2026, 11, 25, 12, 0)), "2026-11-23")
+        self.assertEqual(week_key(_utc(2026, 11, 25, 3, 0)), "2026-11-23")
+
+    def test_sunday_maps_to_monday_six_days_earlier(self):
+        self.assertEqual(week_key(_jst(2026, 11, 29, 10, 0)), "2026-11-23")
+
+    def test_monday_early_morning_maps_to_itself(self):
+        self.assertEqual(week_key(_jst(2026, 11, 23, 0, 30)), "2026-11-23")
+
+    def test_utc_saturday_evening_already_sunday_in_jst(self):
+        # 2026-11-28 16:00 UTC = 11-29 (日) 01:00 JST → その週の月曜日
+        self.assertEqual(week_key(_utc(2026, 11, 28, 16, 0)), "2026-11-23")
+
+    def test_utc_sunday_evening_already_monday_in_jst(self):
+        # 2026-11-22 16:00 UTC = 11-23 (月) 01:00 JST
+        # UTC 基準の週 (11-16 開始) ではなく JST 基準の週になる
+        self.assertEqual(week_key(_utc(2026, 11, 22, 16, 0)), "2026-11-23")
+
+    def test_naive_datetime_treated_as_utc(self):
+        naive = datetime.datetime(2026, 11, 25, 3, 0)
+        self.assertEqual(week_key(naive), "2026-11-23")
+
+
+class TestPreviousWeekKey(unittest.TestCase):
+    def test_previous_week(self):
+        self.assertEqual(previous_week_key(_jst(2026, 11, 25)), "2026-11-16")
+        self.assertEqual(previous_week_key(_jst(2026, 11, 23)), "2026-11-16")
+        self.assertEqual(previous_week_key(_jst(2026, 11, 29)), "2026-11-16")
+
+    def test_consistent_with_week_key_minus_seven_days(self):
+        for dt in (
+            _jst(2026, 11, 23, 0, 30),
+            _jst(2026, 11, 27, 23, 59),
+            _utc(2026, 11, 28, 16, 0),
+            _utc(2026, 12, 1, 0, 0),
+        ):
+            self.assertEqual(
+                previous_week_key(dt),
+                week_key(dt - datetime.timedelta(days=7)),
+            )
+
+
+class TestShouldPost(unittest.TestCase):
+    # 2026-11-30 は月曜日。その前週のキーは "2026-11-23"
+    def test_monday_before_9am_is_false(self):
+        self.assertFalse(should_post(_jst(2026, 11, 30, 8, 59), ""))
+
+    def test_monday_9am_is_true_when_not_posted(self):
+        self.assertTrue(should_post(_jst(2026, 11, 30, 9, 0), ""))
+        self.assertTrue(should_post(_jst(2026, 11, 30, 9, 0), "2026-11-16"))
+        self.assertTrue(should_post(_jst(2026, 11, 30, 23, 59), ""))
+
+    def test_monday_9am_in_utc(self):
+        # 月曜日 09:00 JST = 月曜日 00:00 UTC
+        self.assertTrue(should_post(_utc(2026, 11, 30, 0, 0), ""))
+
+    def test_already_posted_is_false(self):
+        self.assertFalse(should_post(_jst(2026, 11, 30, 9, 0), "2026-11-23"))
+        self.assertFalse(should_post(_jst(2026, 11, 30, 18, 0), "2026-11-23"))
+
+    def test_tuesday_is_false(self):
+        self.assertFalse(should_post(_jst(2026, 12, 1, 10, 0), ""))
+        self.assertFalse(should_post(_jst(2026, 11, 29, 12, 0), ""))
+
+
+class TestComputeGains(unittest.TestCase):
+    def test_basic_gains_and_missing_baseline(self):
+        rows = [(1, 100), (2, 50), (3, 30), (4, 10)]
+        baselines = {1: 40, 2: 50, 3: 10}
+        entries = compute_gains(rows, baselines)
+        # 2 は増加 0 なので除外、4 は基準なし = 0 から増えた扱い
+        self.assertEqual(
+            entries,
+            [
+                {"user_id": 1, "gain": 60, "total_xp": 100},
+                {"user_id": 3, "gain": 20, "total_xp": 30},
+                {"user_id": 4, "gain": 10, "total_xp": 10},
+            ],
+        )
+
+    def test_negative_gain_excluded(self):
+        # 累計が基準を下回る (XP リセット等) 場合は含めない
+        self.assertEqual(compute_gains([(8, 10)], {8: 50}), [])
+
+    def test_tie_breaks_by_total_then_user_id(self):
+        rows = [(7, 150), (6, 200), (5, 200)]
+        baselines = {5: 100, 6: 100, 7: 50}
+        entries = compute_gains(rows, baselines)
+        self.assertEqual([e["user_id"] for e in entries], [5, 6, 7])
+        self.assertTrue(all(e["gain"] == 100 for e in entries))
+
+    def test_empty_inputs(self):
+        self.assertEqual(compute_gains([], {}), [])
+        self.assertEqual(compute_gains([(1, 0)], {}), [])
+        self.assertEqual(compute_gains([(1, 5)], None), [
+            {"user_id": 1, "gain": 5, "total_xp": 5}
+        ])
+
+
+class TestWeekRangeLabel(unittest.TestCase):
+    def test_label(self):
+        self.assertEqual(week_range_label("2026-11-23"), "11/23〜11/29")
+        # 月をまたぐ週
+        self.assertEqual(week_range_label("2026-11-30"), "11/30〜12/6")
+
+
+class TestWeeklyBaselineDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_replace_and_get_round_trip(self):
+        self.assertEqual(self.db.get_xp_baselines(1), {})
+        self.assertEqual(self.db.count_xp_baselines(1), 0)
+        self.db.replace_xp_baselines(1, [(10, 100), (20, 250)])
+        self.assertEqual(self.db.get_xp_baselines(1), {10: 100, 20: 250})
+        self.assertEqual(self.db.count_xp_baselines(1), 2)
+
+    def test_replace_overwrites_previous(self):
+        self.db.replace_xp_baselines(1, [(10, 100), (20, 250)])
+        self.db.replace_xp_baselines(1, [(30, 5)])
+        self.assertEqual(self.db.get_xp_baselines(1), {30: 5})
+        self.assertEqual(self.db.count_xp_baselines(1), 1)
+
+    def test_guild_isolation(self):
+        self.db.replace_xp_baselines(1, [(10, 100)])
+        self.db.replace_xp_baselines(2, [(10, 999), (11, 1)])
+        self.assertEqual(self.db.get_xp_baselines(1), {10: 100})
+        self.assertEqual(self.db.get_xp_baselines(2), {10: 999, 11: 1})
+        self.assertEqual(self.db.count_xp_baselines(1), 1)
+        self.assertEqual(self.db.count_xp_baselines(2), 2)
+
+    def test_get_all_user_xp(self):
+        self.db.upsert_xp(20, 1, 250, 2, 0.0)
+        self.db.upsert_xp(10, 1, 100, 1, 0.0)
+        self.db.upsert_xp(10, 2, 777, 5, 0.0)
+        self.assertEqual(self.db.get_all_user_xp(1), [(10, 100), (20, 250)])
+        self.assertEqual(self.db.get_all_user_xp(2), [(10, 777)])
+        self.assertEqual(self.db.get_all_user_xp(3), [])
+
+
+class TestWeeklySettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_channel_default_unset(self):
+        self.assertEqual(settings.get_weekly_ranking_channel_id(1), 0)
+
+    def test_channel_round_trip(self):
+        settings.set_value(1, settings.WEEKLY_RANKING_CHANNEL_ID, 555)
+        self.assertEqual(settings.get_weekly_ranking_channel_id(1), 555)
+        self.assertEqual(settings.get_weekly_ranking_channel_id(2), 0)
+
+    def test_channel_corrupt_fallback(self):
+        settings.set_value(1, settings.WEEKLY_RANKING_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_weekly_ranking_channel_id(1), 0)
+        settings.set_value(1, settings.WEEKLY_RANKING_CHANNEL_ID, -3)
+        self.assertEqual(settings.get_weekly_ranking_channel_id(1), 0)
+
+    def test_last_week_default_and_round_trip(self):
+        self.assertEqual(settings.get_weekly_ranking_last_week(1), "")
+        settings.set_value(1, settings.WEEKLY_RANKING_LAST_WEEK, "2026-11-23")
+        self.assertEqual(settings.get_weekly_ranking_last_week(1), "2026-11-23")
+        self.assertEqual(settings.get_weekly_ranking_last_week(2), "")
+
+    def test_last_week_corrupt_fallback(self):
+        settings.set_value(1, settings.WEEKLY_RANKING_LAST_WEEK, 20261123)
+        self.assertEqual(settings.get_weekly_ranking_last_week(1), "")
 
 
 if __name__ == "__main__":
