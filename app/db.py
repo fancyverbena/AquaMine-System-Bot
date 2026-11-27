@@ -22,6 +22,10 @@
   temp_vc_channels(channel_id, guild_id, owner_id, created_at)
           -- 一時 VC (ロビー参加で自動作成される個人用 VC) の記録。
              再起動時に実チャンネルと照合して掃除するために使う
+  stats_daily(guild_id, date, metric, channel_id, count)
+          -- サーバー統計の日次カウンタ。date は JST の暦日 (YYYY-MM-DD)、
+             metric は 'message' / 'join' / 'leave'。'message' のときだけ
+             channel_id が意味を持ち (他は 0)
 
 すべてのアクセスは context manager 経由で行い、接続を漏らさない。
 """
@@ -152,6 +156,14 @@ class Database:
                         guild_id INTEGER NOT NULL,
                         owner_id INTEGER NOT NULL,
                         created_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS stats_daily (
+                        guild_id INTEGER NOT NULL,
+                        date TEXT NOT NULL,
+                        metric TEXT NOT NULL,
+                        channel_id INTEGER NOT NULL DEFAULT 0,
+                        count INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (guild_id, date, metric, channel_id)
                     );
                     """
                 )
@@ -626,6 +638,20 @@ class Database:
             )
             return cursor.rowcount
 
+    def count_infractions_in_range(
+        self, guild_id: int, start_ts: float, end_ts: float
+    ) -> int:
+        """期間 [start_ts, end_ts) のギルド全体の違反件数 (統計レポート用)。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM infractions
+                WHERE guild_id = ? AND created_at >= ? AND created_at < ?
+                """,
+                (guild_id, start_ts, end_ts),
+            ).fetchone()
+        return row["c"] if row else 0
+
     # ---------- giveaways (抽選) ----------
 
     @staticmethod
@@ -783,6 +809,20 @@ class Database:
                 (status, json.dumps([int(w) for w in (winners or [])]), giveaway_id),
             )
 
+    def count_giveaways_in_range(
+        self, guild_id: int, start_ts: float, end_ts: float
+    ) -> int:
+        """期間 [start_ts, end_ts) に作成された抽選の件数 (統計レポート用)。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM giveaways
+                WHERE guild_id = ? AND created_at >= ? AND created_at < ?
+                """,
+                (guild_id, start_ts, end_ts),
+            ).fetchone()
+        return row["c"] if row else 0
+
     # ---------- feedback (提案箱・バグ報告) ----------
 
     def create_feedback(
@@ -931,6 +971,23 @@ class Database:
         with self._conn() as conn:
             return self._count_votes(conn, feedback_id)
 
+    def count_feedback_in_range(
+        self, guild_id: int, start_ts: float, end_ts: float
+    ) -> int:
+        """期間 [start_ts, end_ts) のフィードバック投稿数 (統計レポート用)。
+
+        提案・バグ報告の合計。
+        """
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS c FROM feedback
+                WHERE guild_id = ? AND created_at >= ? AND created_at < ?
+                """,
+                (guild_id, start_ts, end_ts),
+            ).fetchone()
+        return row["c"] if row else 0
+
     # ---------- bump_reminders (DISBOARD の Bump リマインダー) ----------
 
     def set_bump_reminder(
@@ -1054,6 +1111,49 @@ class Database:
                     """,
                     (guild_id,),
                 ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- stats_daily (サーバー統計の日次カウンタ) ----------
+
+    def increment_stat(
+        self,
+        guild_id: int,
+        date: str,
+        metric: str,
+        channel_id: int = 0,
+        amount: int = 1,
+    ):
+        """日次カウンタを amount だけ増やす (行が無ければ作る)。
+
+        date は JST の暦日 (YYYY-MM-DD)。metric は 'message' / 'join' /
+        'leave' など。channel_id は 'message' のときだけ意味がある。
+        """
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO stats_daily (guild_id, date, metric, channel_id, count)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(guild_id, date, metric, channel_id)
+                DO UPDATE SET count = count + excluded.count
+                """,
+                (guild_id, date, metric, int(channel_id), int(amount)),
+            )
+
+    def get_stats(self, guild_id: int, start_date: str, end_date: str):
+        """[start_date, end_date] (両端含む) の日次カウンタを dict の列で返す。
+
+        date は YYYY-MM-DD 文字列なので、そのまま文字列比較で範囲を絞れる。
+        並びは日付・指標・チャンネルの昇順 (決定的にするため)。
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT date, metric, channel_id, count FROM stats_daily
+                WHERE guild_id = ? AND date >= ? AND date <= ?
+                ORDER BY date ASC, metric ASC, channel_id ASC
+                """,
+                (guild_id, start_date, end_date),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     # ---------- バックアップ ----------

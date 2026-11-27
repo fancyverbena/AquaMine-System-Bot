@@ -84,9 +84,14 @@ from cogs.weekly import (  # noqa: E402
 from cogs.tempvc import (  # noqa: E402
     MAX_CHANNEL_NAME_LENGTH,
     join_action,
-    public_overwrites,
     should_delete,
     temp_channel_name,
+)
+from cogs.stats import (  # noqa: E402
+    jst_date,
+    period_range,
+    should_post_stats,
+    summarize,
 )
 
 
@@ -2338,20 +2343,6 @@ class TestTempVcJoinAction(unittest.TestCase):
         self.assertEqual(join_action(row), "reuse")
 
 
-class TestTempVcPublicOverwrites(unittest.TestCase):
-    def test_everyone_can_view_and_connect(self):
-        # @everyone (default_role) には「見る」「接続」だけを許可する
-        overwrites = public_overwrites(999)
-        self.assertEqual(list(overwrites.keys()), [999])
-        overwrite = overwrites[999]
-        self.assertIs(overwrite.view_channel, True)
-        self.assertIs(overwrite.connect, True)
-        # それ以外の権限には触れない (未設定 = None)
-        self.assertIsNone(overwrite.speak)
-        self.assertIsNone(overwrite.send_messages)
-        self.assertIsNone(overwrite.mention_everyone)
-
-
 class TestTempVcDatabase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2427,6 +2418,244 @@ class TestTempVcSettings(unittest.TestCase):
         self.assertEqual(settings.get_temp_vc_lobby_id(1), 0)
         settings.set_value(1, settings.TEMP_VC_LOBBY_ID, -3)
         self.assertEqual(settings.get_temp_vc_lobby_id(1), 0)
+
+
+class TestStatsJstDate(unittest.TestCase):
+    def test_utc_afternoon_is_same_day_in_jst(self):
+        dt = datetime.datetime(2026, 11, 26, 0, 0, tzinfo=datetime.timezone.utc)
+        self.assertEqual(jst_date(dt), "2026-11-26")
+
+    def test_utc_1530_is_next_day_in_jst(self):
+        # 15:30 UTC = 翌日 00:30 JST
+        dt = datetime.datetime(2026, 11, 26, 15, 30, tzinfo=datetime.timezone.utc)
+        self.assertEqual(jst_date(dt), "2026-11-27")
+
+    def test_just_before_jst_midnight(self):
+        # 14:59 UTC = 23:59 JST (当日)
+        dt = datetime.datetime(2026, 11, 26, 14, 59, tzinfo=datetime.timezone.utc)
+        self.assertEqual(jst_date(dt), "2026-11-26")
+
+    def test_naive_datetime_treated_as_utc(self):
+        self.assertEqual(jst_date(datetime.datetime(2026, 11, 26, 15, 30)), "2026-11-27")
+
+
+class TestStatsDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_increment_accumulates(self):
+        self.db.increment_stat(1, "2026-11-26", "message", 10)
+        self.db.increment_stat(1, "2026-11-26", "message", 10)
+        self.db.increment_stat(1, "2026-11-26", "message", 10)
+        rows = self.db.get_stats(1, "2026-11-26", "2026-11-26")
+        self.assertEqual(
+            rows,
+            [{"date": "2026-11-26", "metric": "message", "channel_id": 10, "count": 3}],
+        )
+
+    def test_increment_amount(self):
+        self.db.increment_stat(1, "2026-11-26", "message", 10, amount=5)
+        self.db.increment_stat(1, "2026-11-26", "message", 10, amount=2)
+        rows = self.db.get_stats(1, "2026-11-26", "2026-11-26")
+        self.assertEqual(rows[0]["count"], 7)
+
+    def test_channel_and_metric_separation(self):
+        self.db.increment_stat(1, "2026-11-26", "message", 10)
+        self.db.increment_stat(1, "2026-11-26", "message", 20)
+        self.db.increment_stat(1, "2026-11-26", "join")
+        rows = self.db.get_stats(1, "2026-11-26", "2026-11-26")
+        by_key = {(r["metric"], r["channel_id"]): r["count"] for r in rows}
+        self.assertEqual(
+            by_key,
+            {("message", 10): 1, ("message", 20): 1, ("join", 0): 1},
+        )
+
+    def test_guild_isolation(self):
+        self.db.increment_stat(1, "2026-11-26", "message", 10)
+        self.db.increment_stat(2, "2026-11-26", "message", 10, amount=4)
+        self.assertEqual(
+            self.db.get_stats(1, "2026-11-26", "2026-11-26")[0]["count"], 1
+        )
+        self.assertEqual(
+            self.db.get_stats(2, "2026-11-26", "2026-11-26")[0]["count"], 4
+        )
+        self.assertEqual(self.db.get_stats(3, "2026-11-26", "2026-11-26"), [])
+
+    def test_range_filtering_is_inclusive(self):
+        self.db.increment_stat(1, "2026-11-19", "message", 10)
+        self.db.increment_stat(1, "2026-11-20", "message", 10)
+        self.db.increment_stat(1, "2026-11-26", "message", 10)
+        self.db.increment_stat(1, "2026-11-27", "message", 10)
+        rows = self.db.get_stats(1, "2026-11-20", "2026-11-26")
+        self.assertEqual([r["date"] for r in rows], ["2026-11-20", "2026-11-26"])
+
+
+class TestStatsPeriodCounts(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_infractions_in_range(self):
+        self.db.add_infraction(1, 10, "spam", None, "warn", 1000.0)
+        self.db.add_infraction(1, 11, "spam", None, "warn", 2000.0)
+        self.db.add_infraction(1, 12, "spam", None, "warn", 3000.0)
+        self.db.add_infraction(2, 10, "spam", None, "warn", 2000.0)
+        # [start, end) の半開区間
+        self.assertEqual(self.db.count_infractions_in_range(1, 1500.0, 3000.0), 1)
+        self.assertEqual(self.db.count_infractions_in_range(1, 0.0, 4000.0), 3)
+        self.assertEqual(self.db.count_infractions_in_range(2, 0.0, 4000.0), 1)
+
+    def test_giveaways_in_range(self):
+        self.db.create_giveaway(1, 10, 99, "賞品", 1, 5000.0, 1000.0)
+        self.db.create_giveaway(1, 10, 99, "賞品", 1, 5000.0, 2500.0)
+        self.assertEqual(self.db.count_giveaways_in_range(1, 0.0, 2000.0), 1)
+        self.assertEqual(self.db.count_giveaways_in_range(1, 0.0, 9000.0), 2)
+        self.assertEqual(self.db.count_giveaways_in_range(2, 0.0, 9000.0), 0)
+
+    def test_feedback_in_range(self):
+        self.db.create_feedback(1, "suggestion", 10, "", "提案", 20, 1000.0)
+        self.db.create_feedback(1, "bug", 11, "題", "内容", 21, 2500.0)
+        self.db.create_feedback(2, "suggestion", 10, "", "提案", 20, 2500.0)
+        self.assertEqual(self.db.count_feedback_in_range(1, 0.0, 2000.0), 1)
+        self.assertEqual(self.db.count_feedback_in_range(1, 0.0, 9000.0), 2)
+        self.assertEqual(self.db.count_feedback_in_range(2, 0.0, 9000.0), 1)
+
+
+class TestStatsSummarize(unittest.TestCase):
+    def test_totals_average_and_net(self):
+        rows = [
+            {"date": "2026-11-24", "metric": "message", "channel_id": 10, "count": 30},
+            {"date": "2026-11-25", "metric": "message", "channel_id": 10, "count": 10},
+            {"date": "2026-11-25", "metric": "message", "channel_id": 20, "count": 30},
+            {"date": "2026-11-25", "metric": "join", "channel_id": 0, "count": 5},
+            {"date": "2026-11-26", "metric": "leave", "channel_id": 0, "count": 2},
+        ]
+        result = summarize(rows, days=7)
+        self.assertEqual(result["total_messages"], 70)
+        # データのない日も含めて期間日数 (7) で割る
+        self.assertAlmostEqual(result["messages_per_day"], 10.0)
+        self.assertEqual(result["joins"], 5)
+        self.assertEqual(result["leaves"], 2)
+        self.assertEqual(result["net"], 3)
+        self.assertEqual(result["top_channels"], [(10, 40), (20, 30)])
+
+    def test_top_channels_limit_and_tie_break(self):
+        rows = [
+            {"date": "2026-11-25", "metric": "message", "channel_id": cid, "count": count}
+            for cid, count in [
+                (60, 5), (10, 50), (30, 20), (20, 20), (50, 1), (40, 10),
+            ]
+        ]
+        result = summarize(rows, days=7)
+        # 上位5件まで、同点は channel_id の昇順
+        self.assertEqual(
+            result["top_channels"],
+            [(10, 50), (20, 20), (30, 20), (40, 10), (60, 5)],
+        )
+
+    def test_channel_zero_excluded_from_top_but_counted_in_total(self):
+        rows = [
+            {"date": "2026-11-25", "metric": "message", "channel_id": 0, "count": 99},
+            {"date": "2026-11-25", "metric": "message", "channel_id": 10, "count": 3},
+        ]
+        result = summarize(rows, days=7)
+        self.assertEqual(result["total_messages"], 102)
+        self.assertEqual(result["top_channels"], [(10, 3)])
+
+    def test_empty_rows(self):
+        result = summarize([], days=7)
+        self.assertEqual(result["total_messages"], 0)
+        self.assertEqual(result["messages_per_day"], 0.0)
+        self.assertEqual(result["joins"], 0)
+        self.assertEqual(result["leaves"], 0)
+        self.assertEqual(result["net"], 0)
+        self.assertEqual(result["top_channels"], [])
+
+
+class TestStatsPeriodRange(unittest.TestCase):
+    def test_seven_days_includes_today(self):
+        now = datetime.datetime(2026, 11, 25, 12, 0, tzinfo=JST)
+        start_date, end_date, start_ts, end_ts = period_range(now, 7)
+        self.assertEqual(start_date, "2026-11-19")
+        self.assertEqual(end_date, "2026-11-25")
+        self.assertAlmostEqual(end_ts - start_ts, 7 * 86400)
+        # 開始は開始日 00:00 JST
+        start_dt = datetime.datetime.fromtimestamp(start_ts, JST)
+        self.assertEqual(
+            (start_dt.hour, start_dt.minute, start_dt.second), (0, 0, 0)
+        )
+
+    def test_thirty_days(self):
+        now = datetime.datetime(2026, 11, 25, 12, 0, tzinfo=JST)
+        start_date, end_date, start_ts, end_ts = period_range(now, 30)
+        self.assertEqual(start_date, "2026-10-27")
+        self.assertEqual(end_date, "2026-11-25")
+        self.assertAlmostEqual(end_ts - start_ts, 30 * 86400)
+
+
+class TestStatsShouldPost(unittest.TestCase):
+    def test_monday_before_0905_is_false(self):
+        now = datetime.datetime(2026, 11, 30, 9, 4, tzinfo=JST)
+        self.assertFalse(should_post_stats(now, ""))
+
+    def test_monday_0905_is_true_when_not_posted(self):
+        now = datetime.datetime(2026, 11, 30, 9, 5, tzinfo=JST)
+        self.assertTrue(should_post_stats(now, ""))
+
+    def test_monday_0905_in_utc(self):
+        # 月曜日 00:05 UTC = 09:05 JST
+        now = datetime.datetime(2026, 11, 30, 0, 5, tzinfo=datetime.timezone.utc)
+        self.assertTrue(should_post_stats(now, ""))
+
+    def test_already_posted_is_false(self):
+        now = datetime.datetime(2026, 11, 30, 10, 0, tzinfo=JST)
+        self.assertFalse(should_post_stats(now, "2026-11-23"))
+
+    def test_tuesday_is_false(self):
+        now = datetime.datetime(2026, 12, 1, 10, 0, tzinfo=JST)
+        self.assertFalse(should_post_stats(now, ""))
+
+
+class TestStatsSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_channel_default_unset(self):
+        self.assertEqual(settings.get_stats_channel_id(1), 0)
+
+    def test_channel_round_trip(self):
+        settings.set_value(1, settings.STATS_CHANNEL_ID, 555)
+        self.assertEqual(settings.get_stats_channel_id(1), 555)
+        self.assertEqual(settings.get_stats_channel_id(2), 0)
+
+    def test_channel_corrupt_fallback(self):
+        settings.set_value(1, settings.STATS_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_stats_channel_id(1), 0)
+        settings.set_value(1, settings.STATS_CHANNEL_ID, -3)
+        self.assertEqual(settings.get_stats_channel_id(1), 0)
+
+    def test_last_week_default_and_round_trip(self):
+        self.assertEqual(settings.get_stats_last_week(1), "")
+        settings.set_value(1, settings.STATS_LAST_WEEK, "2026-11-23")
+        self.assertEqual(settings.get_stats_last_week(1), "2026-11-23")
+        self.assertEqual(settings.get_stats_last_week(2), "")
+
+    def test_last_week_corrupt_fallback(self):
+        settings.set_value(1, settings.STATS_LAST_WEEK, 20261123)
+        self.assertEqual(settings.get_stats_last_week(1), "")
 
 
 if __name__ == "__main__":

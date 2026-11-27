@@ -45,6 +45,8 @@ AUDIT_VOICE = "audit_voice"
 WEEKLY_RANKING_CHANNEL_ID = "weekly_ranking_channel_id"
 WEEKLY_RANKING_LAST_WEEK = "weekly_ranking_last_week"
 TEMP_VC_LOBBY_ID = "temp_vc_lobby_id"
+STATS_CHANNEL_ID = "stats_channel_id"
+STATS_LAST_WEEK = "stats_last_week"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -421,6 +423,22 @@ def get_temp_vc_lobby_id(guild_id: int) -> int:
     """一時 VC のロビーチャンネル ID (0 は未設定 = 機能オフ)。"""
     value = _get_int(guild_id, TEMP_VC_LOBBY_ID, 0)
     return value if value > 0 else 0
+
+
+def get_stats_channel_id(guild_id: int) -> int:
+    """サーバー統計レポートの自動投稿先チャンネル ID (0 は未設定 = 投稿オフ)。"""
+    value = _get_int(guild_id, STATS_CHANNEL_ID, 0)
+    return value if value > 0 else 0
+
+
+def get_stats_last_week(guild_id: int) -> str:
+    """最後に統計レポートを自動投稿した週のキー (週開始の月曜日の日付)。
+
+    未投稿・壊れた値は空文字。二重投稿の防止に使う (週間ランキングの
+    weekly_ranking_last_week とは独立に管理する)。
+    """
+    value = get(guild_id, STATS_LAST_WEEK, "")
+    return value if isinstance(value, str) else ""
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:
