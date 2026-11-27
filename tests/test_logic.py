@@ -2,6 +2,7 @@
 
 実行: python -m unittest discover -s tests
 """
+import json
 import os
 import sys
 import tempfile
@@ -38,6 +39,7 @@ from cogs.bump import (  # noqa: E402
     extract_bumper_id,
     is_bump_success,
 )
+from cogs.backup import is_due  # noqa: E402
 from cogs.feedback import (  # noqa: E402
     FeedbackStatusButton,
     FeedbackVoteButton,
@@ -1377,6 +1379,138 @@ class TestBumpSettings(unittest.TestCase):
         self.assertEqual(settings.get_bump_notify_role_id(1), 0)
         settings.set_value(1, settings.BUMP_NOTIFY_ROLE_ID, -5)
         self.assertEqual(settings.get_bump_notify_role_id(1), 0)
+
+
+class TestDatabaseBackup(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_backup_to_copies_rows_and_tables(self):
+        import sqlite3
+
+        self.db.set_setting(123, "some_key", "some_value")
+        self.db.upsert_xp(42, 123, 500, 3, 0.0)
+        dest = os.path.join(self.tmp.name, "backup.db")
+        self.db.backup_to(dest)
+
+        self.assertTrue(os.path.exists(dest))
+        with sqlite3.connect(dest) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                "SELECT value FROM guild_settings"
+                " WHERE guild_id = 123 AND key = 'some_key'"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(json.loads(row["value"]), "some_value")
+            xp_row = conn.execute(
+                "SELECT xp, level FROM user_xp"
+                " WHERE user_id = 42 AND guild_id = 123"
+            ).fetchone()
+            self.assertIsNotNone(xp_row)
+            self.assertEqual(xp_row["xp"], 500)
+            self.assertEqual(xp_row["level"], 3)
+            tables = {
+                r["name"]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        for expected in (
+            "guild_settings",
+            "user_xp",
+            "tickets",
+            "infractions",
+            "giveaways",
+            "feedback",
+            "bump_reminders",
+        ):
+            self.assertIn(expected, tables)
+
+    def test_backup_to_creates_parent_directory(self):
+        dest = os.path.join(self.tmp.name, "nested", "dir", "backup.db")
+        self.db.backup_to(dest)
+        self.assertTrue(os.path.exists(dest))
+
+
+class TestBackupIsDue(unittest.TestCase):
+    def test_never_run_is_due(self):
+        self.assertTrue(is_due(None, 1_000_000.0, 24))
+        self.assertTrue(is_due(0, 1_000_000.0, 24))
+        self.assertTrue(is_due(0.0, 1_000_000.0, 1))
+
+    def test_just_ran_is_not_due(self):
+        now = 1_000_000.0
+        self.assertFalse(is_due(now, now, 24))
+        self.assertFalse(is_due(now - 3600, now, 24))
+
+    def test_interval_elapsed_is_due(self):
+        now = 1_000_000.0
+        self.assertTrue(is_due(now - 24 * 3600, now, 24))
+        self.assertTrue(is_due(now - 25 * 3600, now, 24))
+        # 境界の手前はまだ
+        self.assertFalse(is_due(now - 24 * 3600 + 1, now, 24))
+
+    def test_zero_or_negative_interval_never_due(self):
+        now = 1_000_000.0
+        self.assertFalse(is_due(None, now, 0))
+        self.assertFalse(is_due(0, now, 0))
+        self.assertFalse(is_due(now - 10 * 24 * 3600, now, 0))
+        self.assertFalse(is_due(None, now, -1))
+
+
+class TestBackupSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_channel_default_unset(self):
+        self.assertEqual(settings.get_backup_channel_id(1), 0)
+
+    def test_channel_round_trip(self):
+        settings.set_value(1, settings.BACKUP_CHANNEL_ID, 987654)
+        self.assertEqual(settings.get_backup_channel_id(1), 987654)
+        self.assertEqual(settings.get_backup_channel_id(2), 0)
+
+    def test_channel_corrupt_fallback(self):
+        settings.set_value(1, settings.BACKUP_CHANNEL_ID, "abc")
+        self.assertEqual(settings.get_backup_channel_id(1), 0)
+        settings.set_value(1, settings.BACKUP_CHANNEL_ID, -5)
+        self.assertEqual(settings.get_backup_channel_id(1), 0)
+
+    def test_interval_default_24(self):
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+
+    def test_interval_round_trip(self):
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 6)
+        self.assertEqual(settings.get_backup_interval_hours(1), 6)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 0)
+        self.assertEqual(settings.get_backup_interval_hours(1), 0)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 168)
+        self.assertEqual(settings.get_backup_interval_hours(1), 168)
+        self.assertEqual(settings.get_backup_interval_hours(2), 24)
+
+    def test_interval_out_of_range_fallback(self):
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, 169)
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, -1)
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+        settings.set_value(1, settings.BACKUP_INTERVAL_HOURS, "abc")
+        self.assertEqual(settings.get_backup_interval_hours(1), 24)
+
+    def test_last_at_default_and_round_trip(self):
+        self.assertEqual(settings.get_backup_last_at(1), 0.0)
+        settings.set_value(1, settings.BACKUP_LAST_AT, 1700000000.5)
+        self.assertEqual(settings.get_backup_last_at(1), 1700000000.5)
+        self.assertEqual(settings.get_backup_last_at(2), 0.0)
 
 
 try:

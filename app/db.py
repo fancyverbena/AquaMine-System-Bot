@@ -813,6 +813,22 @@ class Database:
                 (guild_id,),
             )
 
+    # ---------- バックアップ ----------
+
+    def backup_to(self, dest_path: str):
+        """DB の一貫したコピーを dest_path に書き出す。
+
+        sqlite3 の backup API を使うため、Bot が稼働中 (書き込みが
+        あり得る状態) でも途中の状態を掴まないコピーが得られる。
+        単なるファイルコピーは避けること。
+        """
+        directory = os.path.dirname(dest_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with closing(sqlite3.connect(self.path)) as source:
+            with closing(sqlite3.connect(dest_path)) as dest:
+                source.backup(dest)
+
 
 def next_vote(current, clicked):
     """投票ボタンの遷移を決める純粋関数。

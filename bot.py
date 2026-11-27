@@ -42,6 +42,7 @@ class Bot(commands.Bot):
             "cogs.giveaway",
             "cogs.feedback",
             "cogs.bump",
+            "cogs.backup",
             "cogs.help",
         ):
             await self.load_extension(extension)
