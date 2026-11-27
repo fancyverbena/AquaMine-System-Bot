@@ -3,7 +3,7 @@
 構成:
   app/   共通基盤 (設定, DB, UI, 権限チェック)
   cogs/  機能ごと (admin, verify, tickets, leveling, automod, roles,
-         giveaway, feedback, bump, backup, serverlog, help)
+         giveaway, feedback, bump, backup, serverlog, weekly, help)
 データはすべて data/bot.db (SQLite) に保存される。
 """
 import discord
@@ -49,6 +49,7 @@ class Bot(commands.Bot):
             "cogs.bump",
             "cogs.backup",
             "cogs.serverlog",
+            "cogs.weekly",
             "cogs.help",
         ):
             await self.load_extension(extension)
