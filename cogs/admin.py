@@ -371,6 +371,17 @@ class AdminCog(commands.Cog):
             inline=False,
         )
 
+        notify_roles = settings.get_ticket_notify_roles(gid)
+        embed.add_field(
+            name="チケット評価・担当通知",
+            value=(
+                "評価 "
+                + ("ON" if settings.get_ticket_rating_enabled(gid) else "OFF")
+                + f" / 担当通知 {len(notify_roles)}種類に設定"
+            ),
+            inline=False,
+        )
+
         level_roles = settings.get_level_roles(gid)
         if level_roles:
             lines = []

@@ -5,6 +5,9 @@
   user_xp(user_id, guild_id, xp, level, last_message_time, recent_content_hashes)
   tickets(channel_id, guild_id, owner_id, assignee_id, ticket_type,
           subject, message_id, created_at, last_activity_at)
+  ticket_ratings(ticket_id, guild_id, user_id, rating, created_at)
+          -- ticket_id は tickets の channel_id。rating=0 は評価待ち
+             (閉鎖時に DM を送ったが未回答)、1〜5 が実際の評価
   infractions(id, guild_id, user_id, reason, detail, punishment, created_at)
   giveaways(id, guild_id, channel_id, message_id, host_id, prize,
             winner_count, ends_at, status, winners, created_at)
@@ -124,6 +127,13 @@ class Database:
                         message_id INTEGER,
                         created_at REAL NOT NULL,
                         last_activity_at REAL NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS ticket_ratings (
+                        ticket_id INTEGER PRIMARY KEY,
+                        guild_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        rating INTEGER NOT NULL,
+                        created_at REAL NOT NULL
                     );
                     """
                 )
@@ -393,6 +403,93 @@ class Database:
                 "DELETE FROM tickets WHERE channel_id = ?",
                 (channel_id,),
             )
+
+    # ---------- ticket_ratings (閉鎖後の満足度評価) ----------
+
+    def create_ticket_rating_prompt(
+        self, ticket_id: int, guild_id: int, user_id: int, now: float
+    ) -> bool:
+        """評価待ちの行 (rating=0) を作る。すでにあれば False。
+
+        チケット閉鎖時に作成者へ DM で評価ボタンを送る際、誰が・どの
+        ギルドのチケットを評価できるかを再起動後も検証できるよう、
+        先にこの行を記録する (tickets 行自体は閉鎖時に消えるため)。
+        """
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO ticket_ratings (
+                    ticket_id, guild_id, user_id, rating, created_at
+                ) VALUES (?, ?, ?, 0, ?)
+                """,
+                (ticket_id, guild_id, user_id, now),
+            )
+            return cursor.rowcount > 0
+
+    def complete_ticket_rating(
+        self, ticket_id: int, user_id: int, rating: int, now: float
+    ) -> bool:
+        """評価待ちの行を実際の評価 (1〜5) で確定する。
+
+        確定できたら True。評価待ちの行がない・別ユーザーの行・
+        評価済みの場合は何もせず False。範囲外の rating は ValueError。
+        """
+        if not (1 <= rating <= 5):
+            raise ValueError(f"rating は 1〜5 で指定してください: {rating}")
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE ticket_ratings SET rating = ?, created_at = ?
+                WHERE ticket_id = ? AND user_id = ? AND rating = 0
+                """,
+                (rating, now, ticket_id, user_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_ticket_rating(self, ticket_id: int):
+        """チケットの評価行 (評価待ち含む) を dict で返す。なければ None。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM ticket_ratings WHERE ticket_id = ?",
+                (ticket_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_ticket_rating(self, ticket_id: int):
+        """評価行を消す (DM が送れなかった評価待ち行の掃除用)。"""
+        with self._conn() as conn:
+            conn.execute(
+                "DELETE FROM ticket_ratings WHERE ticket_id = ?",
+                (ticket_id,),
+            )
+
+    def ticket_rating_stats(self, guild_id: int) -> dict:
+        """ギルドの評価集計。評価待ち (rating=0) は含まない。
+
+        戻り値: {"count": 件数, "average": 平均 (0件なら 0.0),
+                 "distribution": {1: 件数, ..., 5: 件数}}
+        """
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT rating, COUNT(*) AS c FROM ticket_ratings
+                WHERE guild_id = ? AND rating BETWEEN 1 AND 5
+                GROUP BY rating
+                """,
+                (guild_id,),
+            ).fetchall()
+        distribution = {stars: 0 for stars in range(1, 6)}
+        count = 0
+        total = 0
+        for row in rows:
+            distribution[row["rating"]] = row["c"]
+            count += row["c"]
+            total += row["rating"] * row["c"]
+        return {
+            "count": count,
+            "average": (total / count) if count else 0.0,
+            "distribution": distribution,
+        }
 
     # ---------- infractions (自動モデレーションの違反履歴) ----------
 

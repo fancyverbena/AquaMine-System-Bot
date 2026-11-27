@@ -55,6 +55,11 @@ from cogs.roles import (  # noqa: E402
     panel_add_error,
     toggle_actions,
 )
+from cogs.tickets import (  # noqa: E402
+    TicketRatingButton,
+    rating_block_reason,
+    valid_ticket_type,
+)
 
 
 class TestLevelMath(unittest.TestCase):
@@ -1571,6 +1576,208 @@ class TestRankCard(unittest.TestCase):
     def test_load_font_never_raises(self):
         self.assertIsNotNone(_load_font(24))
         self.assertIsNotNone(_load_font(24, bold=True))
+
+
+class TestTicketRatingDatabase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _prompt(self, ticket_id=555, guild_id=100, user_id=7):
+        return self.db.create_ticket_rating_prompt(
+            ticket_id, guild_id, user_id, 1000.0
+        )
+
+    def test_prompt_and_complete_round_trip(self):
+        self.assertTrue(self._prompt())
+        row = self.db.get_ticket_rating(555)
+        self.assertEqual(row["guild_id"], 100)
+        self.assertEqual(row["user_id"], 7)
+        self.assertEqual(row["rating"], 0)  # 評価待ち
+        self.assertTrue(self.db.complete_ticket_rating(555, 7, 4, 2000.0))
+        row = self.db.get_ticket_rating(555)
+        self.assertEqual(row["rating"], 4)
+        self.assertEqual(row["created_at"], 2000.0)
+        self.assertIsNone(self.db.get_ticket_rating(99999))
+
+    def test_duplicate_prompt_ignored(self):
+        self.assertTrue(self._prompt())
+        self.assertFalse(self._prompt())
+        # 評価済みの行にもプロンプトは作れない
+        self.assertTrue(self.db.complete_ticket_rating(555, 7, 5, 2000.0))
+        self.assertFalse(self._prompt())
+
+    def test_complete_without_prompt_fails(self):
+        self.assertFalse(self.db.complete_ticket_rating(555, 7, 3, 2000.0))
+        self.assertIsNone(self.db.get_ticket_rating(555))
+
+    def test_double_rating_rejected(self):
+        self._prompt()
+        self.assertTrue(self.db.complete_ticket_rating(555, 7, 2, 2000.0))
+        # 2回目は確定できず、最初の評価が残る
+        self.assertFalse(self.db.complete_ticket_rating(555, 7, 5, 3000.0))
+        self.assertEqual(self.db.get_ticket_rating(555)["rating"], 2)
+
+    def test_other_user_cannot_complete(self):
+        self._prompt(user_id=7)
+        self.assertFalse(self.db.complete_ticket_rating(555, 8, 5, 2000.0))
+        self.assertEqual(self.db.get_ticket_rating(555)["rating"], 0)
+
+    def test_stars_out_of_range_raise(self):
+        self._prompt()
+        for bad in (0, 6, -1):
+            with self.assertRaises(ValueError):
+                self.db.complete_ticket_rating(555, 7, bad, 2000.0)
+        self.assertEqual(self.db.get_ticket_rating(555)["rating"], 0)
+
+    def test_delete_prompt(self):
+        self._prompt()
+        self.db.delete_ticket_rating(555)
+        self.assertIsNone(self.db.get_ticket_rating(555))
+
+    def test_stats_math(self):
+        # ギルド100: ⭐5, ⭐4, ⭐4 と評価待ち1件 (集計対象外)
+        for ticket_id, user_id, stars in ((1, 7, 5), (2, 8, 4), (3, 9, 4)):
+            self._prompt(ticket_id=ticket_id, user_id=user_id)
+            self.assertTrue(
+                self.db.complete_ticket_rating(ticket_id, user_id, stars, 2000.0)
+            )
+        self._prompt(ticket_id=4, user_id=10)
+        # ギルド200: ⭐1 が1件 (ギルド100の集計に混ざらない)
+        self._prompt(ticket_id=5, guild_id=200, user_id=11)
+        self.assertTrue(self.db.complete_ticket_rating(5, 11, 1, 2000.0))
+
+        stats = self.db.ticket_rating_stats(100)
+        self.assertEqual(stats["count"], 3)
+        self.assertAlmostEqual(stats["average"], 13 / 3)
+        self.assertEqual(
+            stats["distribution"], {1: 0, 2: 0, 3: 0, 4: 2, 5: 1}
+        )
+
+        stats200 = self.db.ticket_rating_stats(200)
+        self.assertEqual(stats200["count"], 1)
+        self.assertEqual(stats200["average"], 1.0)
+
+    def test_stats_empty_guild(self):
+        stats = self.db.ticket_rating_stats(100)
+        self.assertEqual(stats["count"], 0)
+        self.assertEqual(stats["average"], 0.0)
+        self.assertEqual(
+            stats["distribution"], {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+        )
+
+
+class TestTicketRatingDecision(unittest.TestCase):
+    def _row(self, user_id=7, rating=0):
+        return {
+            "ticket_id": 555,
+            "guild_id": 100,
+            "user_id": user_id,
+            "rating": rating,
+            "created_at": 1000.0,
+        }
+
+    def test_ok(self):
+        self.assertIsNone(rating_block_reason(self._row(), 7, 1))
+        self.assertIsNone(rating_block_reason(self._row(), 7, 5))
+
+    def test_missing_row(self):
+        self.assertIsNotNone(rating_block_reason(None, 7, 3))
+
+    def test_non_creator_rejected(self):
+        self.assertIsNotNone(rating_block_reason(self._row(), 8, 3))
+
+    def test_already_rated_rejected(self):
+        self.assertIsNotNone(rating_block_reason(self._row(rating=4), 7, 3))
+
+    def test_stars_out_of_range_rejected(self):
+        self.assertIsNotNone(rating_block_reason(self._row(), 7, 0))
+        self.assertIsNotNone(rating_block_reason(self._row(), 7, 6))
+
+
+class TestTicketNotifySettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_valid_ticket_type(self):
+        for key in ("question", "report", "whitelist", "other"):
+            self.assertTrue(valid_ticket_type(key))
+        self.assertFalse(valid_ticket_type("unknown"))
+        self.assertFalse(valid_ticket_type(""))
+
+    def test_rating_enabled_default_on(self):
+        self.assertTrue(settings.get_ticket_rating_enabled(1))
+
+    def test_rating_enabled_round_trip_and_corrupt(self):
+        settings.set_value(1, settings.TICKET_RATING_ENABLED, False)
+        self.assertFalse(settings.get_ticket_rating_enabled(1))
+        # 壊れた値は既定 (有効) にフォールバック
+        settings.set_value(1, settings.TICKET_RATING_ENABLED, "off")
+        self.assertTrue(settings.get_ticket_rating_enabled(1))
+        # ギルドごとに独立
+        self.assertTrue(settings.get_ticket_rating_enabled(2))
+
+    def test_notify_roles_default_unset(self):
+        self.assertEqual(settings.get_ticket_notify_roles(1), {})
+        self.assertEqual(settings.get_ticket_notify_role(1, "question"), 0)
+
+    def test_notify_roles_round_trip_per_type(self):
+        settings.set_ticket_notify_role(1, "question", 111)
+        settings.set_ticket_notify_role(1, "whitelist", 222)
+        self.assertEqual(settings.get_ticket_notify_role(1, "question"), 111)
+        self.assertEqual(settings.get_ticket_notify_role(1, "whitelist"), 222)
+        self.assertEqual(settings.get_ticket_notify_role(1, "report"), 0)
+        self.assertEqual(
+            settings.get_ticket_notify_roles(1),
+            {"question": 111, "whitelist": 222},
+        )
+        # ギルドごとに独立
+        self.assertEqual(settings.get_ticket_notify_roles(2), {})
+
+    def test_notify_role_clear(self):
+        settings.set_ticket_notify_role(1, "question", 111)
+        settings.set_ticket_notify_role(1, "question", None)
+        self.assertEqual(settings.get_ticket_notify_role(1, "question"), 0)
+        settings.set_ticket_notify_role(1, "report", 333)
+        settings.set_ticket_notify_role(1, "report", 0)
+        self.assertEqual(settings.get_ticket_notify_roles(1), {})
+
+    def test_notify_roles_corrupt_fallback(self):
+        settings.set_value(1, settings.TICKET_NOTIFY_ROLES, "garbage")
+        self.assertEqual(settings.get_ticket_notify_roles(1), {})
+        # 数値化できないロール ID は落とされる
+        settings.set_value(
+            1, settings.TICKET_NOTIFY_ROLES, {"question": "abc", "report": "5"}
+        )
+        self.assertEqual(settings.get_ticket_notify_roles(1), {"report": 5})
+
+
+class TestTicketRatingButtonDynamicItem(unittest.TestCase):
+    def test_custom_id_and_template(self):
+        button = TicketRatingButton(42, 3)
+        self.assertEqual(button.custom_id, "v2:ticketrate:42:3")
+        self.assertEqual(button.ticket_id, 42)
+        self.assertEqual(button.stars, 3)
+        self.assertTrue(button.is_persistent())
+        match = button.template.fullmatch("v2:ticketrate:123:5")
+        self.assertIsNotNone(match)
+        self.assertEqual(match["ticket_id"], "123")
+        self.assertEqual(match["stars"], "5")
+        # 他のコンポーネントの custom_id にはマッチしない
+        self.assertIsNone(button.template.fullmatch("v2:role:42"))
+        self.assertIsNone(button.template.fullmatch("v2:giveaway:42"))
+        self.assertIsNone(button.template.fullmatch("v2:fbvote:42:up"))
+        self.assertIsNone(button.template.fullmatch("v2:ticketrate:abc:3"))
+        self.assertIsNone(button.template.fullmatch("v2:ticketrate:42"))
 
 
 if __name__ == "__main__":

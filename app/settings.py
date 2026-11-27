@@ -32,6 +32,8 @@ BUMP_NOTIFY_ROLE_ID = "bump_notify_role_id"
 BACKUP_CHANNEL_ID = "backup_channel_id"
 BACKUP_INTERVAL_HOURS = "backup_interval_hours"
 BACKUP_LAST_AT = "backup_last_at"
+TICKET_RATING_ENABLED = "ticket_rating_enabled"
+TICKET_NOTIFY_ROLES = "ticket_notify_roles"
 
 DEFAULT_AUTO_CLOSE_HOURS = 48
 MAX_AUTO_CLOSE_HOURS = 720
@@ -279,6 +281,50 @@ def get_backup_last_at(guild_id: int) -> float:
         return float(get(guild_id, BACKUP_LAST_AT, 0) or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def get_ticket_rating_enabled(guild_id: int) -> bool:
+    """チケット閉鎖後の満足度評価 (DM で ⭐1〜5 を聞く) の有効/無効。
+
+    既定は有効、壊れた値は有効扱い。
+    """
+    value = get(guild_id, TICKET_RATING_ENABLED, True)
+    return value if isinstance(value, bool) else True
+
+
+def get_ticket_notify_roles(guild_id: int) -> dict:
+    """チケット種類ごとの担当通知ロール {種類キー: ロールID (int)}。
+
+    壊れた値や数値化できないロール ID は落とす。種類キーの妥当性は
+    呼び出し側 (cogs.tickets の TICKET_TYPES) で検証する。
+    """
+    roles = get(guild_id, TICKET_NOTIFY_ROLES, {})
+    if not isinstance(roles, dict):
+        return {}
+    result = {}
+    for ticket_type, role_id in roles.items():
+        try:
+            role_id = int(role_id)
+        except (TypeError, ValueError):
+            continue
+        if role_id > 0:
+            result[str(ticket_type)] = role_id
+    return result
+
+
+def get_ticket_notify_role(guild_id: int, ticket_type: str) -> int:
+    """その種類の担当通知ロール ID (0 は未設定)。"""
+    return get_ticket_notify_roles(guild_id).get(ticket_type, 0)
+
+
+def set_ticket_notify_role(guild_id: int, ticket_type: str, role_id):
+    """種類ごとの担当通知ロールを設定する。role_id が 0/None なら解除。"""
+    roles = get_ticket_notify_roles(guild_id)
+    if role_id:
+        roles[ticket_type] = int(role_id)
+    else:
+        roles.pop(ticket_type, None)
+    set_value(guild_id, TICKET_NOTIFY_ROLES, roles)
 
 
 def get_role_panel_exclusive(guild_id: int) -> bool:

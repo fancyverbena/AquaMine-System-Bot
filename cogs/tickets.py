@@ -3,8 +3,17 @@
 作成: パネルの種類セレクト -> 件名/詳細モーダル -> 専用チャンネル + DB 行。
 対応: 担当する/閉じるボタン、/ticket assign|add|remove。
 自動クローズ: 無発言が設定時間を超えたチケットを記録付きで閉鎖する。
+評価: 閉鎖時に作成者へ DM で ⭐1〜5 の満足度を聞く (任意・1回だけ)。
+      ボタンは DynamicItem 方式 (custom_id は
+      `v2:ticketrate:<チケットID>:<星の数>`、チケットID = チャンネルID)
+      で、評価できるのは作成者本人のみ。誰が評価できるかは閉鎖時に
+      ticket_ratings へ「評価待ち (rating=0)」として記録しておく
+      (tickets 行自体は閉鎖時に消えるため)。
+担当通知: 種類ごとに通知ロールを設定すると (/ticket notify)、その種類の
+      チケットが作られたときにチャンネル内でロールをメンションする。
 """
 import os
+import re
 import time
 
 import discord
@@ -51,6 +60,146 @@ ACTIVITY_WRITE_INTERVAL = 60  # 秒: last_activity_at の DB 書き込み間引�
 def type_label(ticket_type: str) -> str:
     info = TICKET_TYPES.get(ticket_type, TICKET_TYPES["other"])
     return f"{info['emoji']} {info['label']}"
+
+
+def valid_ticket_type(ticket_type: str) -> bool:
+    """定義済みのチケット種類かどうか。"""
+    return ticket_type in TICKET_TYPES
+
+
+# ---------- 閉鎖後の満足度評価 ----------
+
+RATING_TEMPLATE = r"v2:ticketrate:(?P<ticket_id>[0-9]+):(?P<stars>[0-9]+)"
+
+
+def rating_block_reason(rating_row, clicker_id: int, stars: int):
+    """評価ボタンを受け付けられない理由を返す純粋関数 (可能なら None)。
+
+    rating_row は db.get_ticket_rating の戻り値 (評価待ちは rating=0)。
+    作成者本人・未評価・⭐1〜5 のすべてを満たすときだけ None。
+    """
+    if rating_row is None:
+        return "この評価は無効になっています（対象のチケットが見つかりません）。"
+    if rating_row["user_id"] != clicker_id:
+        return "評価できるのはチケットの作成者だけです。"
+    if rating_row["rating"] != 0:
+        return "このチケットはすでに評価済みです。"
+    if not (1 <= stars <= 5):
+        return "評価は ⭐1〜⭐5 で選んでください。"
+    return None
+
+
+def stars_text(stars: int) -> str:
+    return "⭐" * stars
+
+
+def build_rating_view(ticket_id: int, selected: int = None):
+    """評価ボタン一式。selected を渡すと全ボタンを無効化し選択肢を強調する。"""
+    view = discord.ui.View(timeout=None)
+    for stars in range(1, 6):
+        view.add_item(
+            TicketRatingButton(
+                ticket_id,
+                stars,
+                disabled=selected is not None,
+                selected=selected == stars,
+            )
+        )
+    return view
+
+
+class TicketRatingButton(
+    discord.ui.DynamicItem[discord.ui.Button], template=RATING_TEMPLATE
+):
+    """チケットID と星の数を custom_id に埋め込む動的ボタン (DM 用)。"""
+
+    def __init__(
+        self,
+        ticket_id: int,
+        stars: int,
+        disabled: bool = False,
+        selected: bool = False,
+    ):
+        super().__init__(
+            discord.ui.Button(
+                label=str(stars),
+                emoji="⭐",
+                style=(
+                    discord.ButtonStyle.success
+                    if selected
+                    else discord.ButtonStyle.secondary
+                ),
+                custom_id=f"v2:ticketrate:{ticket_id}:{stars}",
+                disabled=disabled,
+            )
+        )
+        self.ticket_id = ticket_id
+        self.stars = stars
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Button,
+        match: re.Match,
+        /,
+    ):
+        return cls(int(match["ticket_id"]), int(match["stars"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        await handle_ticket_rating(interaction, self.ticket_id, self.stars)
+
+
+async def handle_ticket_rating(
+    interaction: discord.Interaction, ticket_id: int, stars: int
+):
+    """評価ボタンのクリック処理 (DynamicItem の callback から呼ばれる)。
+
+    クリックは作成者の DM 内で起きるため interaction.guild は None。
+    ギルドとログチャンネルは評価行 (ticket_ratings) 経由で引く。
+    """
+    clicker = interaction.user
+    if clicker.bot:
+        return
+    row = db.get_ticket_rating(ticket_id)
+    reason = rating_block_reason(row, clicker.id, stars)
+    if reason is not None:
+        await reply_error(interaction, reason)
+        return
+
+    if not db.complete_ticket_rating(ticket_id, clicker.id, stars, time.time()):
+        await reply_error(interaction, "このチケットはすでに評価済みです。")
+        return
+
+    try:
+        await interaction.response.edit_message(
+            content=(
+                f"⭐ 評価ありがとうございました！\n"
+                f"あなたの評価: {stars_text(stars)}（{stars}/5）"
+            ),
+            view=build_rating_view(ticket_id, selected=stars),
+        )
+    except discord.HTTPException:
+        # 評価自体は DB に記録済み。表示の更新失敗は無視する
+        pass
+
+    # ログチャンネルが設定されていれば結果を知らせる
+    guild = interaction.client.get_guild(row["guild_id"])
+    if guild is None:
+        return
+    log_id = settings.get(guild.id, settings.LOG_CHANNEL_ID)
+    if not log_id:
+        return
+    log_channel = guild.get_channel(int(log_id))
+    if not isinstance(log_channel, discord.TextChannel):
+        return
+    try:
+        await log_channel.send(
+            f"⭐ チケット評価: {stars_text(stars)}（{stars}/5）"
+            f"（チケットID: {ticket_id}、作成者: <@{row['user_id']}>）"
+        )
+    except discord.HTTPException:
+        pass
 
 
 def build_ticket_panel():
@@ -328,6 +477,20 @@ class TicketsCog(commands.Cog):
             )
             return
 
+        # 種類ごとの担当通知ロールが設定されていれば呼び出す
+        notify_role_id = settings.get_ticket_notify_role(guild.id, ticket_type)
+        if notify_role_id:
+            notify_role = guild.get_role(notify_role_id)
+            if notify_role is not None:
+                try:
+                    await channel.send(
+                        f"🔔 {notify_role.mention}\n"
+                        f"{type_label(ticket_type)} の担当者をお呼びしています。"
+                        "対応までしばらくお待ちください。"
+                    )
+                except discord.HTTPException:
+                    pass
+
         await interaction.response.send_message(
             f"✅ チケットを作成しました → {channel.mention}",
             ephemeral=True,
@@ -511,6 +674,9 @@ class TicketsCog(commands.Cog):
                 except discord.HTTPException:
                     pass
 
+        if settings.get_ticket_rating_enabled(guild.id):
+            await self._send_rating_prompt(guild, row, channel.name)
+
         db.delete_ticket(channel.id)
 
         if followup is not None:
@@ -529,6 +695,35 @@ class TicketsCog(commands.Cog):
         except discord.HTTPException:
             pass
         return True
+
+    async def _send_rating_prompt(
+        self, guild: discord.Guild, row: dict, channel_name: str
+    ):
+        """閉鎖したチケットの作成者へ評価 DM を送る (失敗は静かに諦める)。"""
+        owner_id = row["owner_id"]
+        owner = guild.get_member(owner_id)
+        if owner is None:
+            try:
+                owner = await self.bot.fetch_user(owner_id)
+            except discord.HTTPException:
+                owner = None
+        if owner is None or owner.bot:
+            return
+        # クリック時に「作成者本人か」を再起動後も検証できるよう、
+        # tickets 行が消える前に評価待ち (rating=0) として記録しておく
+        db.create_ticket_rating_prompt(
+            row["channel_id"], guild.id, owner_id, time.time()
+        )
+        try:
+            await owner.send(
+                f"⭐ チケット `{channel_name}` の対応はどうでしたか？\n"
+                f"件名: {row['subject'] or '(なし)'}\n"
+                "下のボタンで評価してください（⭐1〜⭐5、任意・1回だけ）。",
+                view=build_rating_view(row["channel_id"]),
+            )
+        except discord.HTTPException:
+            # DM 拒否などで送れなかった評価待ち行は残しても意味がないので消す
+            db.delete_ticket_rating(row["channel_id"])
 
     # ---------- /ticket コマンド群 ----------
 
@@ -632,6 +827,93 @@ class TicketsCog(commands.Cog):
             await self._update_status_field(row, "未担当")
         await interaction.response.send_message(
             f"➖ {member.mention} をこのチケットから外しました。"
+        )
+
+    @ticket_group.command(
+        name="notify",
+        description="種類ごとの担当通知ロールを設定します（サポート/管理者）",
+    )
+    @app_commands.describe(
+        ticket_type="チケットの種類",
+        role="通知するロール（省略すると解除）",
+    )
+    @app_commands.choices(
+        ticket_type=[
+            app_commands.Choice(
+                name=f"{info['emoji']} {info['label']}", value=key
+            )
+            for key, info in TICKET_TYPES.items()
+        ]
+    )
+    async def ticket_notify(
+        self,
+        interaction: discord.Interaction,
+        ticket_type: str,
+        role: discord.Role = None,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            await reply_error(interaction, "このコマンドはサーバー内でのみ使えます。")
+            return
+        if not checks.is_support_or_admin(interaction, guild.id):
+            await reply_error(
+                interaction, "担当通知を設定できるのはサポートと管理者だけです。"
+            )
+            return
+        if not valid_ticket_type(ticket_type):
+            await reply_error(interaction, "不明なチケットの種類です。")
+            return
+        label = type_label(ticket_type)
+        if role is None:
+            current = settings.get_ticket_notify_role(guild.id, ticket_type)
+            settings.set_ticket_notify_role(guild.id, ticket_type, None)
+            if current:
+                await interaction.response.send_message(
+                    f"✅ {label} の担当通知ロールを解除しました。",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    f"{label} の担当通知ロールは未設定です。",
+                    ephemeral=True,
+                )
+            return
+        settings.set_ticket_notify_role(guild.id, ticket_type, role.id)
+        await interaction.response.send_message(
+            f"✅ {label} の担当通知ロールを {role.mention} に設定しました。\n"
+            f"この種類のチケットが作られると、チャンネル内で担当者をお呼びします。",
+            ephemeral=True,
+        )
+
+    @ticket_group.command(
+        name="ratings",
+        description="チケット評価の集計を表示します（サポート/管理者）",
+    )
+    async def ticket_ratings(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            await reply_error(interaction, "このコマンドはサーバー内でのみ使えます。")
+            return
+        if not checks.is_support_or_admin(interaction, guild.id):
+            await reply_error(
+                interaction, "評価の集計を見られるのはサポートと管理者だけです。"
+            )
+            return
+        stats = db.ticket_rating_stats(guild.id)
+        if stats["count"] == 0:
+            await interaction.response.send_message(
+                "まだチケット評価がありません。", ephemeral=True
+            )
+            return
+        distribution = " / ".join(
+            f"⭐{stars}: {stats['distribution'][stars]}件"
+            for stars in range(5, 0, -1)
+        )
+        await interaction.response.send_message(
+            f"⭐ チケット評価の集計\n"
+            f"平均: ⭐{stats['average']:.1f}（{stats['count']}件）\n"
+            f"内訳: {distribution}",
+            ephemeral=True,
         )
 
     # ---------- アクティビティ記録 & 自動クローズ ----------
