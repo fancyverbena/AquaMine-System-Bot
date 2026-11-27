@@ -1379,5 +1379,65 @@ class TestBumpSettings(unittest.TestCase):
         self.assertEqual(settings.get_bump_notify_role_id(1), 0)
 
 
+try:
+    import io as _io
+
+    from PIL import Image as _PILImage
+
+    from app.rankcard import (
+        CARD_HEIGHT as _CARD_HEIGHT,
+        CARD_WIDTH as _CARD_WIDTH,
+        generate_rank_card as _generate_rank_card,
+        load_font as _load_font,
+    )
+
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+
+
+@unittest.skipUnless(_HAS_PIL, "Pillow がインストールされていない")
+class TestRankCard(unittest.TestCase):
+    def _dummy_avatar(self):
+        buf = _io.BytesIO()
+        _PILImage.new("RGB", (128, 128), (200, 60, 60)).save(buf, format="PNG")
+        return buf.getvalue()
+
+    def _generate(self, avatar_bytes):
+        return _generate_rank_card(
+            display_name="テストユーザー",
+            level=5,
+            rank_position=2,
+            total_xp=777,
+            fraction=0.5,
+            remaining_xp=68,
+            next_level=6,
+            next_threshold=845,
+            avatar_bytes=avatar_bytes,
+        )
+
+    def test_card_with_avatar(self):
+        png = self._generate(self._dummy_avatar())
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(png), 5000)
+        img = _PILImage.open(_io.BytesIO(png))
+        self.assertEqual(img.size, (_CARD_WIDTH, _CARD_HEIGHT))
+
+    def test_card_without_avatar_uses_fallback(self):
+        png = self._generate(None)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(png), 5000)
+        img = _PILImage.open(_io.BytesIO(png))
+        self.assertEqual(img.size, (_CARD_WIDTH, _CARD_HEIGHT))
+
+    def test_card_with_broken_avatar_bytes_uses_fallback(self):
+        png = self._generate(b"not-a-png")
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_load_font_never_raises(self):
+        self.assertIsNotNone(_load_font(24))
+        self.assertIsNotNone(_load_font(24, bold=True))
+
+
 if __name__ == "__main__":
     unittest.main()
