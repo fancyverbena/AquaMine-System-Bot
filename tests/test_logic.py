@@ -2,6 +2,7 @@
 
 実行: python -m unittest discover -s tests
 """
+import datetime
 import json
 import os
 import sys
@@ -14,9 +15,12 @@ from app import settings  # noqa: E402
 from app.db import Database, next_vote  # noqa: E402
 from app.ui import progress_bar, sanitize_channel_part  # noqa: E402
 from cogs.automod import (  # noqa: E402
+    contains_link,
     content_violation,
     find_invite,
     find_ngword,
+    is_link_restricted,
+    link_restriction_violation,
     punishment_for_count,
     spam_reason,
 )
@@ -1979,6 +1983,116 @@ class TestAuditLogHelpers(unittest.TestCase):
         truncated = truncate_content(long_text)
         self.assertEqual(len(truncated), 1000)
         self.assertTrue(truncated.endswith("…"))
+
+
+class TestAutomodLinkRestrict(unittest.TestCase):
+    def setUp(self):
+        self.now = datetime.datetime(
+            2026, 1, 8, 12, 0, tzinfo=datetime.timezone.utc
+        )
+
+    def test_contains_link_schemes(self):
+        self.assertTrue(contains_link("https://example.com/page"))
+        self.assertTrue(contains_link("http://example.com"))
+
+    def test_contains_link_uppercase_scheme(self):
+        self.assertTrue(contains_link("HTTPS://EXAMPLE.COM"))
+        self.assertTrue(contains_link("Http://example.com"))
+
+    def test_contains_link_mid_sentence(self):
+        self.assertTrue(contains_link("これ見て https://example.com すごいよ"))
+
+    def test_contains_link_negative(self):
+        self.assertFalse(contains_link("普通の文章です"))
+        # スキームなしのベアドメインはリンクとみなさない
+        self.assertFalse(contains_link("example.com にアクセスして"))
+        self.assertFalse(contains_link("www.example.com"))
+        self.assertFalse(contains_link(""))
+        self.assertFalse(contains_link(None))
+
+    def test_is_link_restricted_within_window(self):
+        joined = self.now - datetime.timedelta(days=3)
+        self.assertTrue(is_link_restricted(joined, self.now, 7))
+        joined = self.now - datetime.timedelta(hours=1)
+        self.assertTrue(is_link_restricted(joined, self.now, 7))
+
+    def test_is_link_restricted_boundary_is_free(self):
+        # ちょうど N 日経過したら制限は解ける
+        joined = self.now - datetime.timedelta(days=7)
+        self.assertFalse(is_link_restricted(joined, self.now, 7))
+
+    def test_is_link_restricted_past_window(self):
+        joined = self.now - datetime.timedelta(days=30)
+        self.assertFalse(is_link_restricted(joined, self.now, 7))
+
+    def test_is_link_restricted_disabled(self):
+        # 日数 0 以下は制限自体が無効 (参加直後でも対象外)
+        self.assertFalse(is_link_restricted(self.now, self.now, 0))
+        self.assertFalse(is_link_restricted(self.now, self.now, -3))
+
+    def test_is_link_restricted_unknown_join_time(self):
+        # 参加日時不明なら処罰しない (フェイルオープン)
+        self.assertFalse(is_link_restricted(None, self.now, 7))
+
+    def test_link_restriction_violation(self):
+        joined = self.now - datetime.timedelta(days=1)
+        result = link_restriction_violation(
+            "https://example.com", joined, self.now, 7
+        )
+        self.assertEqual(result[0], "new_member_link")
+        self.assertIn("7日間", result[1])
+        # リンクがなければ違反でない
+        self.assertIsNone(
+            link_restriction_violation("こんにちは", joined, self.now, 7)
+        )
+        # 制限期間を過ぎていれば違反でない
+        old_member = self.now - datetime.timedelta(days=10)
+        self.assertIsNone(
+            link_restriction_violation(
+                "https://example.com", old_member, self.now, 7
+            )
+        )
+        # 宣伝許可チャンネルでは検知しない
+        self.assertIsNone(
+            link_restriction_violation(
+                "https://example.com", joined, self.now, 7, allow_links=True
+            )
+        )
+
+
+class TestAutomodLinkRestrictSettings(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._orig_db = settings.db
+        settings.db = Database(os.path.join(self.tmp.name, "test.db"))
+
+    def tearDown(self):
+        settings.db = self._orig_db
+        self.tmp.cleanup()
+
+    def test_default_is_7(self):
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 7)
+
+    def test_round_trip(self):
+        settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, 30)
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 30)
+        # 0 (無効) と上限 90 もそのまま保持される
+        settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, 0)
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 0)
+        settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, 90)
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 90)
+        # 他ギルドには影響しない
+        self.assertEqual(settings.get_automod_link_restrict_days(2), 7)
+
+    def test_out_of_range_fallback(self):
+        settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, 91)
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 7)
+        settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, -1)
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 7)
+
+    def test_corrupt_fallback(self):
+        settings.set_value(1, settings.AUTOMOD_LINK_RESTRICT_DAYS, "abc")
+        self.assertEqual(settings.get_automod_link_restrict_days(1), 7)
 
 
 if __name__ == "__main__":
