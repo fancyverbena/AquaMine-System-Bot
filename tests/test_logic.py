@@ -84,6 +84,7 @@ from cogs.weekly import (  # noqa: E402
 from cogs.tempvc import (  # noqa: E402
     MAX_CHANNEL_NAME_LENGTH,
     join_action,
+    public_overwrites,
     should_delete,
     temp_channel_name,
 )
@@ -2341,6 +2342,20 @@ class TestTempVcJoinAction(unittest.TestCase):
     def test_reuse_when_existing(self):
         row = {"channel_id": 123, "guild_id": 1, "owner_id": 42}
         self.assertEqual(join_action(row), "reuse")
+
+
+class TestTempVcPublicOverwrites(unittest.TestCase):
+    def test_everyone_can_view_and_connect(self):
+        # @everyone (default_role) には「見る」「接続」だけを許可する
+        overwrites = public_overwrites(999)
+        self.assertEqual(list(overwrites.keys()), [999])
+        overwrite = overwrites[999]
+        self.assertIs(overwrite.view_channel, True)
+        self.assertIs(overwrite.connect, True)
+        # それ以外の権限には触れない (未設定 = None)
+        self.assertIsNone(overwrite.speak)
+        self.assertIsNone(overwrite.send_messages)
+        self.assertIsNone(overwrite.mention_everyone)
 
 
 class TestTempVcDatabase(unittest.TestCase):
